@@ -67,6 +67,10 @@ _SELF_CLEARING_STORAGE_CAUSES = frozenset({"compression", "compression_closed", 
 # Process-watcher retries of a refused completion: ~5 min at the default 5 s check interval.
 _MAX_COMPLETION_INJECTION_ATTEMPTS = 8
 _COMPLETION_INJECTION_RETRY_MAX_DELAY = 60
+# An async delegation completion that stays undelivered this long (or this many passes) gets ONE
+# plain-chat notice while the durable row keeps retrying: a refusal must never be silent.
+_STUCK_COMPLETION_NOTICE_REFUSALS = _MAX_COMPLETION_INJECTION_ATTEMPTS
+_STUCK_COMPLETION_NOTICE_AFTER_S = 300.0
 # Drain retries of a refused watch event follow the same bounded-backoff policy, keyed to the
 # 2 s drain cadence instead of the watcher's check interval (#140899).
 _WATCH_INJECTION_RETRY_BASE_DELAY = 4.0
@@ -187,6 +191,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         owner_session_id: str = ""  # owning session the pre-flight proved for the completion's pin
         proven_session_id: str = ""  # session the pre-flight proved delivery reaches (a compression tip included)
         defer: bool = False  # unadmitted retry: settle without spending a delivery attempt
+        previous_session_id: str = ""  # parent session that rotated away; delivery retargets to the route's live one
 
     async def _deliver_platform_notice(self, source, content: str) -> None:
         """Deliver a setup/operational notice using platform-specific privacy rules."""
@@ -1168,7 +1173,42 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         elif verdict == "retry":
             # Transient uncertainty before admission: re-poll without spending a delivery attempt.
             claim.proceed, claim.early_result, claim.defer = False, False, True
+        elif verdict == "deliver" and evt_type == "async_delegation":
+            rotated_to = await self._rotated_route_target(claim.owner_session_id, str(evt.get("session_key") or ""))
+            if rotated_to:
+                claim.previous_session_id = claim.owner_session_id
+                claim.owner_session_id = claim.proven_session_id = rotated_to
         return claim
+
+    async def _rotated_route_target(self, owner_session_id: str, session_key: str) -> str:
+        """The live session of the SAME route a rotated-away parent's completion should land in, else ``""``.
+
+        Preflight calls an idle/timeout-ended parent deliverable (the classic resolver retargets it), yet
+        the session authority admits only the route's current session or its compression successor, so
+        the wake was refused forever. Retarget only on proof: the parent row ended for a non-compression,
+        non-user-boundary reason AND is stamped with this very ``session_key``, and the key's route still
+        runs a different, un-ended session. A /new boundary, another key's session, or a route with no
+        live session never qualifies, and the caller falls through to refusal handling and its notice."""
+        from gateway.run import _USER_BOUNDARY_END_REASONS
+        session_db = getattr(self, "_session_db", None)
+        if not (session_key and owner_session_id and session_db is not None):
+            return ""
+        try:
+            store: SessionStore = cast(Any, self).session_store
+            await asyncio.to_thread(store._ensure_loaded)
+            entry = store._entries.get(session_key)
+            if entry is None or entry.suspended or entry.session_id == owner_session_id:
+                return ""
+            old = await session_db.get_session(owner_session_id)
+            if (old is None or not old.get("ended_at")
+                    or str(old.get("end_reason") or "") in ("compression", *_USER_BOUNDARY_END_REASONS)
+                    or str(old.get("session_key") or "") != session_key):
+                return ""
+            live = await session_db.get_session(entry.session_id)
+            return entry.session_id if live is not None and not live.get("ended_at") else ""
+        except Exception:
+            logger.debug("Rotated-route lookup failed for %s", session_key, exc_info=True)
+            return ""
 
     def _completion_event_scope(self, evt: dict):
         """Profile runtime scope of the session a completion event targets (a no-op context when the
@@ -1233,6 +1273,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         identity = self._completion_delivery_identity(evt)
         claim = self._CompletionClaim()
         accepted = identity_claimed = refused = False
+        queued_evt = evt  # the copy the watcher requeues; it carries the refusal reason and counters
         try:
             claim = await self._preflight_completion_delivery(evt)
             if not claim.proceed:
@@ -1254,6 +1295,9 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             completion_ids = [claim.delegation_id] if claim.claim_id else []
             completion_ids += [sibling["delegation_id"] for sibling, claim_id in sibling_claims if claim_id]
             evt = {**evt, "completion_ids": completion_ids}
+            if claim.previous_session_id:
+                synth_text = (f"[前セッションの委任結果: セッション {claim.previous_session_id} から引き継いだ"
+                              f"バックグラウンド委任の完了通知です。現在の会話の続きではありません。]\n{synth_text}")
             injection_result = await self._inject_watch_notification(synth_text, evt, raise_not_accepted=True)
             if injection_result is not True:
                 return injection_result
@@ -1267,6 +1311,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             # ``dropped`` across restarts too (#141153); any other (restart wait, full FIFO, an owner
             # not yet proven) is refunded and never drops a completion the owner will take later.
             refused = not exc.permanent
+            for refused_evt in (queued_evt, *(sibling for sibling, _claim_id in sibling_claims)):
+                refused_evt["_watch_refusal_reason"] = exc.reason or str(exc)
             return False
         finally:
             if identity_claimed and not accepted:
@@ -1624,11 +1670,70 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                             self._back_off_refused_completions(group)
                             for evt in group:
                                 _pr.completion_queue.put(evt)
+                            # After the requeue: a notice failure must never requeue the group twice.
+                            await self._notify_stuck_completions(group)
                     except Exception as e:
                         for evt in group:
                             _pr.completion_queue.put(evt)
                         logger.error("Async delegation injection error: %s", e)
             await asyncio.sleep(interval)
+
+    async def _notify_stuck_completions(self, group: list[dict]) -> None:
+        """Never silent: once a completion has been refused ``_STUCK_COMPLETION_NOTICE_REFUSALS`` passes in a
+        row (``_watch_retry_step``, counted on the requeued event copy) or for ``_STUCK_COMPLETION_NOTICE_AFTER_S``,
+        post ONE plain notice to its chat (no model turn). The durable row stays pending and keeps retrying;
+        the notice is deduped per delegation_id across event copies."""
+        now = time.monotonic()
+        for evt in group:
+            delegation_id = str(evt.get("delegation_id") or "")
+            first_refused_at = evt.setdefault("_watch_first_refused_at", now)
+            if not delegation_id or evt.get("task_failure_notice") or evt.get("_watch_stuck_notified"):
+                continue
+            if (int(evt.get("_watch_retry_step") or 0) < _STUCK_COMPLETION_NOTICE_REFUSALS
+                    and now - first_refused_at < _STUCK_COMPLETION_NOTICE_AFTER_S):
+                continue
+            noticed = self.__dict__.setdefault("_stuck_completion_notices", set())
+            if len(noticed) > 4096:
+                noticed.clear()
+            evt["_watch_stuck_notified"] = True
+            if delegation_id in noticed:
+                continue
+            noticed.add(delegation_id)
+            try:
+                await self._send_stuck_completion_notice(evt)
+            except Exception:
+                logger.warning("Could not post the stuck-delivery notice for delegation %s", delegation_id,
+                               exc_info=True)
+
+    async def _send_stuck_completion_notice(self, evt: dict) -> None:
+        """Concise, non-conversational notice for an async delegation completion that cannot be delivered."""
+        delegation_id = str(evt.get("delegation_id") or "")
+        reason = str(evt.get("_watch_refusal_reason") or "delivery not ready (route or adapter unavailable)")
+        goals = evt.get("goals") or [evt.get("goal") or ""]
+        goal = " ".join(str(goals[0] or "").split())[:120] or "(no goal recorded)"
+        logger.warning(
+            "Async delegation %s completion undelivered after %s refusals: %s; posting a notice, still retrying.",
+            delegation_id, evt.get("_watch_retry_step"), reason,
+        )
+        source = await asyncio.to_thread(self._build_process_event_source, evt)
+        platform = getattr(source, "platform", None)
+        platform_name = (getattr(platform, "value", platform) if source else evt.get("platform")) or ""
+        chat_id = source.chat_id if source else evt.get("chat_id")
+        thread_id = source.thread_id if source else evt.get("thread_id")
+        if not (platform_name and chat_id):
+            return
+        from gateway.warning_notifications import present_notification
+        async with self._completion_event_scope(evt):
+            from tools.async_delegation import _db_path
+            text = (
+                f"⚠️ Background delegation {delegation_id} ({evt.get('status') or 'finished'}) could not be "
+                f"delivered into this conversation: {reason}. Goal: {goal}. Still retrying; the result is kept "
+                f"in the ledger ({_db_path()}) and can be fetched with "
+                f"delegate_task(action='result', delegation_id='{delegation_id}')."
+            )
+            await present_notification(
+                lambda: self._send_watcher_message(str(platform_name), chat_id, thread_id, text, evt),
+                platform=platform_name, diagnostic=True)
 
     @staticmethod
     def _back_off_refused_completions(group: list[dict]) -> None:

@@ -195,7 +195,7 @@ def _is_descendant_of(child_agent: Any, parent_agent: Any, max_hops: int = 8) ->
 
 # Model-facing control actions accepted by delegate_task(action=...).
 # "spawn" (or omitted) keeps the historical spawn semantics.
-_CONTROL_ACTIONS = frozenset({"list", "steer", "stop"})
+_CONTROL_ACTIONS = frozenset({"list", "steer", "stop", "result"})
 
 def _resolve_session_lineage(session_id: Optional[str], parent_agent: Any) -> str:
     """Tip of a session id's compression lineage via the parent's live SessionDB (best-effort; input unchanged when
@@ -261,11 +261,50 @@ def _list_payload(parent_agent: Any) -> dict[str, Any]:
         )
     return payload
 
-def _handle_control_action(action: str, subagent_id: Optional[str], message: Optional[str], parent_agent: Any) -> str:
-    """Synchronous control plane for delegate_task: list/steer/stop. Runs in-turn (never backgrounded) over the same
-    registry the TUI overlay drives, scoped so a conversation can only control its own spawn tree."""
+def _owns_durable_delegation(row: dict[str, Any], parent_agent: Any) -> bool:
+    """True when *parent_agent*'s conversation spawned this durable ledger row: its ``parent_session_id`` (or the UI
+    session id stamped at dispatch) matches the caller's session after compression-lineage resolution on both sides.
+    A row that names no owner is never owned — except a worker-ledger read, which the worker store already
+    scopes to the calling session (``_owned``)."""
+    parent_sid = str(getattr(parent_agent, "session_id", "") or "")
+    owners = [str(row.get(key) or "") for key in ("parent_session_id", "origin_ui_session_id")]
+    if not parent_sid:
+        return False
+    if not any(owners):
+        from tools.async_delegation_worker import worker_ledger
+        return worker_ledger() is not None
+    mine = {parent_sid, _resolve_session_lineage(parent_sid, parent_agent)}
+    return any(owner and (owner in mine or _resolve_session_lineage(owner, parent_agent) in mine) for owner in owners)
+
+def _result_payload(delegation_id: Optional[str], parent_agent: Any) -> str:
+    """action='result': the durable record of one async delegation of THIS conversation — state, delivery state,
+    attempts, timings and the full stored result (incl. per-child partial entries). Missing and foreign ids fail
+    closed with the same error, so an id never reveals another session's data or even its existence."""
+    did = (delegation_id or "").strip()
+    if not did:
+        return tool_error("action='result' requires delegation_id (from the spawn dispatch response or a completion notice).")
+    from tools.async_delegation import get_durable_delegation
+    try:
+        row = get_durable_delegation(did)
+    except Exception as exc:
+        logger.debug("delegate_task result lookup failed for %s: %s", did, exc)
+        return tool_error(f"Could not read the delegation ledger for '{did}'.")
+    if row is None or not _owns_durable_delegation(row, parent_agent):
+        return tool_error(f"No delegation '{did}' found for this conversation.")
+    payload = {key: row.get(key) for key in (
+        "delegation_id", "state", "delivery_state", "delivery_attempts", "dispatched_at", "completed_at", "delivered_at",
+        "result")}
+    return json.dumps({"action": "result", **payload}, ensure_ascii=False, default=str)
+
+def _handle_control_action(action: str, subagent_id: Optional[str], message: Optional[str], parent_agent: Any,
+                           delegation_id: Optional[str] = None) -> str:
+    """Synchronous control plane for delegate_task: list/steer/stop/result. Runs in-turn (never backgrounded) over the
+    same registry the TUI overlay drives, scoped so a conversation can only control its own spawn tree (``result``
+    reads the durable ledger, scoped to the conversation's session lineage)."""
     if action == "list":
         return json.dumps(_list_payload(parent_agent), ensure_ascii=False)
+    if action == "result":
+        return _result_payload(delegation_id, parent_agent)
 
     # steer / stop need a resolvable, owned target.
     sid = (subagent_id or "").strip()
@@ -283,7 +322,7 @@ def _handle_control_action(action: str, subagent_id: Optional[str], message: Opt
         return tool_error("action='steer' requires a non-empty 'message' describing the course correction.")
     outcome = _CONTROL_OUTCOMES.get(action)
     if outcome is None:
-        return tool_error(f"Unknown action '{action}'. Use spawn, list, steer, or stop.")
+        return tool_error(f"Unknown action '{action}'. Use spawn, list, steer, stop, or result.")
     status, note, failure = outcome
     ok = interrupt_subagent(sid) if action == "stop" else steer_subagent(sid, message.strip())
     if ok:

@@ -326,8 +326,23 @@ def admission_display(payload):
     return card
 
 
+# The only SessionSource facts that decide WHERE a wake lands and WHO it speaks for. ``scope_id`` is
+# the canonical guild/workspace key (``to_dict`` dual-writes the deprecated ``guild_id`` alias).
+_ROUTE_IDENTITY_KEYS = ('platform', 'chat_id', 'chat_type', 'thread_id', 'user_id', 'scope_id',
+                        'parent_chat_id', 'profile')
+
+
 def _route_identity(source):
-    return {key: value for key, value in source.to_dict().items() if key != 'message_id'}
+    """Routing/provenance identity of *source*, compared between a wake and the route's committed envelope.
+
+    Invariant: display metadata must never invalidate a route. ``chat_name``/``chat_topic`` change when a
+    thread is renamed, ``auto_thread_created``/``auto_thread_initial_name`` exist only on the origin that
+    created the thread (never on a later human message), and ``user_name``/``is_bot`` are cosmetic; none of
+    them says where the wake goes. ``message_id`` is the platform reply anchor. Absent and empty values are
+    skipped so a field one side never recorded cannot mismatch a ``None`` on the other."""
+    data = source.to_dict()
+    data['scope_id'] = data.get('scope_id') or data.get('guild_id')
+    return {key: data[key] for key in _ROUTE_IDENTITY_KEYS if data.get(key)}
 
 
 def committed_route_envelope(authority, entry):
