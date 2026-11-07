@@ -1141,6 +1141,13 @@ class _Scanner(ast.NodeVisitor):
                     return
                 body = slash + tail
             text = unquote(body)
+            if text != body:
+                # SQLite percent-decodes the path, so '%2E%2E' is '..' and '%2F' is '/'. A body
+                # that only looks in-root while being written is exactly the traversal case: do
+                # not reason about it, ask the human.
+                self.connects.append((None, False, False, line))
+                self.rev(node, "read:dynamic", "sqlite3.connect: percent-encoded file: URI path")
+                return
             if not text or "\x00" in text:
                 self.connects.append((None, False, False, line))
                 self.rev(node, "read:dynamic", "sqlite3.connect: file: URI path is empty or contains NUL")

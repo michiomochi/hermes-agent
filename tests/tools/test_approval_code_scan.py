@@ -532,3 +532,16 @@ def test_coarse_capability_keys_are_not_persistable(env, code):
 ])
 def test_fine_grained_keys_stay_persistable(env, code):
     assert capability_persistable(env.scan(code))
+
+
+def test_blocker3_percent_encoded_uri_path_is_never_safe(env):
+    """SQLite percent-decodes the URI path, so a body can look in-root in the source text and
+    still name a different file. The scanner refuses to reason about an encoded path at all:
+    it must be REVIEW even when the decoded target happens to land inside a write root and the
+    SQL is read-only."""
+    scan = env.scan(
+        "import sqlite3\n"
+        "c = sqlite3.connect('file:@S@/%2E/x.db', uri=True)\n"
+        "print(c.execute('SELECT 1').fetchone())\n"
+    )
+    assert scan.tier == "review" and "read:dynamic" in scan.features, (scan.reasons, sorted(scan.features))
