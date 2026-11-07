@@ -19,11 +19,11 @@ lowers a guardian DENY/ESCALATE and is not a security boundary (SECURITY.md §2.
 deterministic filter in front of the LLM. Any internal failure degrades to ``review``.
 
 The allow-list reasons about a program as if it ran in a *fresh* interpreter (``str`` is the string type, ``open`` is
-the builtin, the cwd is where the child started). A session kernel runs every cell in ONE namespace, so
-:func:`scan_python` also takes what earlier cells left behind (``prior_bindings`` / ``prior_chdir``;
-:class:`KernelScanState` accumulates them) and reports the names the cell itself leaves
-(``CodeScan.top_level_bindings``). Only a cell that reads none of the prior names, in a kernel where nothing
-unvetted ran, can be SAFE.
+the builtin, the cwd is where the child started). A session kernel runs every cell in ONE namespace, so what an
+earlier cell left behind (a rebound ``str``, a patched module, a changed cwd) would invalidate that reading. The scan
+does not try to track it: :func:`scan_python` takes ``kernel_fresh`` and a program is SAFE only when it is the FIRST
+cell of its kernel. Any later cell is REVIEW (``state:prior-cell``), whatever it contains. Following the state across
+cells (``__del__`` / generators / ``register_adapter`` ...) is a separate piece of work, deliberately not done here.
 
 ``features`` describe what the program can do (``net:none``, ``write:roots``, ``proc:gated`` …);
 :func:`capability_key` folds them into an approval key so a "session" grant covers a capability
@@ -47,6 +47,11 @@ logger = logging.getLogger("tools.approval")
 
 Tier = Literal["safe", "review", "high"]
 
+PRIOR_CELL_FEATURE = "state:prior-cell"
+IMPORT_PATH_FEATURE = "write:import-path"
+# Files the interpreter imports or runs on its own (modules, bytecode, extension modules, ``.pth`` startup hooks).
+_IMPORT_SUFFIXES = (".py", ".pyc", ".pyo", ".pyw", ".pyd", ".so", ".pth")
+
 MAX_SAFE_LINES = 400
 MAX_SAFE_BYTES = 32 * 1024
 _MAX_SCAN_BYTES = 1024 * 1024
@@ -59,30 +64,6 @@ class CodeScan:
     tier: Tier
     features: frozenset[str]
     reasons: tuple[str, ...]
-    # Names the program leaves in the module namespace (imports, defs, assignments at any nesting, ``global`` in a
-    # function ...). Empty when the program could not be analysed; the kernel state then treats the cell as unvouched
-    # (see :meth:`KernelScanState.after`: it is not SAFE).
-    top_level_bindings: frozenset[str] = frozenset()
-
-
-@dataclass(frozen=True)
-class KernelScanState:
-    """What the cells that already ran in one session kernel may have left behind.
-
-    ``bindings`` are the names they bound in the shared namespace. ``chdir_possible`` is set once ANY earlier cell was
-    not SAFE (or was never scanned): such a cell may have called ``os.chdir``, patched a module, or bound names
-    through ``exec`` / ``globals()``, none of which the bindings capture, so from then on nothing in that kernel is
-    SAFE until it is reset. A SAFE cell cannot do either (``os`` and every module-patching route are REVIEW).
-    """
-
-    bindings: frozenset[str] = frozenset()
-    chdir_possible: bool = False
-
-    def after(self, scan: CodeScan | None) -> KernelScanState:
-        """The state once a cell with this scan (None: never scanned) has run."""
-        if scan is None:
-            return KernelScanState(self.bindings, True)
-        return KernelScanState(self.bindings | scan.top_level_bindings, self.chdir_possible or scan.tier != "safe")
 
 
 # --- Capability axes ----------------------------------------------------------------------------------------------
@@ -130,7 +111,9 @@ def capability_persistable(scan: CodeScan) -> bool:
     ``read:dynamic``, ``read:homedot`` (any dot entry directly under $HOME) and ``proc:direct`` (``git status`` and
     ``curl -T secrets https://…`` are the same key: the arguments, ``env=`` and ``cwd=`` are not part of it) each
     cover an unbounded set of targets under ONE key, so a single approval would pass all of them. Those are decided
-    per run; every other key is as fine-grained as it ever was.
+    per run; every other key is as fine-grained as it ever was. The same goes for ``state:prior-cell`` (a later cell of
+    a kernel: the scan's reading of the program no longer holds, so a grant would cover whatever the earlier cells
+    left behind) and ``write:import-path`` (any Python file in an import directory).
     """
     best: dict[str, int] = {}
     for feature in scan.features:
@@ -139,6 +122,8 @@ def capability_persistable(scan: CodeScan) -> bool:
         if order is not None and value in order:
             best[axis] = max(best.get(axis, 0), order.index(value))
     if best.get("write", 0) >= _AXES["write"].index("outside"):
+        return False
+    if PRIOR_CELL_FEATURE in scan.features or IMPORT_PATH_FEATURE in scan.features:
         return False
     if best.get("read", 0) >= _AXES["read"].index("dynamic") or "read:homedot" in scan.features:
         return False
@@ -400,180 +385,16 @@ def _digest(code: str) -> str:
     return hashlib.sha256(code.encode("utf-8", "surrogatepass")).hexdigest()[:16]
 
 
-# --- Scopes: what a cell leaves in / reads from the kernel's shared namespace ---------------------------------------
-_FUNCTION_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
-_COMPREHENSION_NODES = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
-
-
-def _target_names(node) -> set[str]:
-    """Names bound by an assignment / ``for`` / ``with`` target (attribute and subscript targets bind nothing)."""
-    if isinstance(node, ast.Name):
-        return {node.id}
-    if isinstance(node, (ast.Tuple, ast.List)):
-        return set().union(*(_target_names(e) for e in node.elts)) if node.elts else set()
-    if isinstance(node, ast.Starred):
-        return _target_names(node.value)
-    return set()
-
-
-def _import_names(node: ast.Import | ast.ImportFrom) -> set[str]:
-    return {(a.asname or a.name.split(".")[0]) for a in node.names if a.name != "*"}
-
-
-def _scope_names(body: Sequence[ast.stmt], params: Sequence[str] = ()) -> set[str]:
-    """Names bound in the scope whose statements are ``body``: assignments, ``for``/``with``/``except`` targets,
-    ``del``, imports, defs, classes and walrus targets (also those inside comprehensions, which bind in the enclosing
-    scope). It does not descend into nested functions / lambdas / classes: their names are their own."""
-    names: set[str] = set(params)
-
-    def walk(node, in_comprehension: bool = False) -> None:
-        for child in ast.iter_child_nodes(node):
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                names.add(child.name)
-                continue
-            if isinstance(child, ast.Lambda):
-                continue
-            if isinstance(child, ast.Name) and isinstance(child.ctx, (ast.Store, ast.Del)):
-                # A comprehension's own loop variables are local to it; only its walrus targets leak.
-                if not in_comprehension or isinstance(node, ast.NamedExpr):
-                    names.add(child.id)
-            elif isinstance(child, (ast.Import, ast.ImportFrom)):
-                names.update(_import_names(child))
-            elif isinstance(child, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and child.name:
-                names.add(child.name)
-            elif isinstance(child, ast.MatchMapping) and child.rest:
-                names.add(child.rest)
-            walk(child, in_comprehension or isinstance(child, _COMPREHENSION_NODES))
-
-    for stmt in body:
-        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            names.add(stmt.name)
-            continue
-        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
-            names.update(_import_names(stmt))
-        walk(ast.Module(body=[stmt], type_ignores=[]))
-    return names
-
-
-def _declared(body_owner, kinds) -> set[str]:
-    return {n for sub in ast.walk(body_owner) if isinstance(sub, kinds) for n in sub.names}
-
-
-def _function_locals(fn) -> set[str]:
-    a = fn.args
-    params = [x.arg for x in (*a.posonlyargs, *a.args, *a.kwonlyargs)]
-    params += [x.arg for x in (a.vararg, a.kwarg) if x is not None]
-    if isinstance(fn, ast.Lambda):
-        return _scope_names([ast.Expr(value=fn.body)], params)
-    return (_scope_names(fn.body, params) - _declared(fn, ast.Global)) | _declared(fn, ast.Nonlocal)
-
-
-def _global_reads(node, shadow: frozenset, out: set) -> None:
-    """Add to ``out`` the names ``node`` reads from the MODULE namespace: loads that no enclosing function /
-    comprehension scope shadows, including the ones inside function bodies (they run later, at some call)."""
-    if isinstance(node, ast.Name):
-        if isinstance(node.ctx, ast.Load) and node.id not in shadow:
-            out.add(node.id)
-        return
-    if isinstance(node, ast.AugAssign):
-        if isinstance(node.target, ast.Name) and node.target.id not in shadow:
-            out.add(node.target.id)
-        else:
-            _global_reads(node.target, shadow, out)
-        _global_reads(node.value, shadow, out)
-        return
-    if isinstance(node, _FUNCTION_NODES):
-        pre, body = _function_reads(node, shadow)
-        out |= pre | body
-        return
-    if isinstance(node, _COMPREHENSION_NODES):
-        inner = shadow | set().union(*(_target_names(g.target) for g in node.generators))
-        for i, gen in enumerate(node.generators):
-            _global_reads(gen.iter, shadow if i == 0 else inner, out)   # the first iterable is the enclosing scope's
-            for cond in gen.ifs:
-                _global_reads(cond, inner, out)
-        for part in ((node.key, node.value) if isinstance(node, ast.DictComp) else (node.elt,)):
-            _global_reads(part, inner, out)
-        return
-    for child in ast.iter_child_nodes(node):
-        _global_reads(child, shadow, out)
-
-
-def _function_reads(fn, shadow: frozenset) -> tuple[set, set]:
-    """``(read when the def statement runs, read when the body runs)`` for a function or lambda."""
-    pre: set = set()
-    a = fn.args
-    for part in (*a.defaults, *(d for d in a.kw_defaults if d is not None), *getattr(fn, "decorator_list", ())):
-        _global_reads(part, shadow, pre)
-    for arg in (*a.posonlyargs, *a.args, *a.kwonlyargs, a.vararg, a.kwarg):
-        if arg is not None and arg.annotation is not None:
-            _global_reads(arg.annotation, shadow, pre)
-    if getattr(fn, "returns", None) is not None:
-        _global_reads(fn.returns, shadow, pre)
-    body: set = set()
-    inner = shadow | _function_locals(fn)
-    for stmt in (fn.body if isinstance(fn.body, list) else [fn.body]):
-        _global_reads(stmt, inner, body)
-    return pre, body
-
-
-def _module_bindings(tree: ast.Module) -> frozenset:
-    """Every name the program can leave in the module namespace, ``global`` declarations in functions included."""
-    return frozenset(_scope_names(tree.body) | _declared(tree, ast.Global))
-
-
-def _prior_conflicts(tree: ast.Module, prior: frozenset) -> list:
-    """Names in ``prior`` that the program may read BEFORE it has certainly rebound them, in order.
-
-    Walks the top-level statements in execution order. A name is *cleared* once a top-level statement that always runs
-    has bound it (import, def, class, plain assignment, ``for`` / ``with`` target); reads after that point see the
-    program's own value. Everything else — a read earlier in the cell, inside a function defined earlier, a binding
-    under ``if`` / ``try`` / ``while`` — may see what an earlier cell left there.
-    """
-    cleared: set[str] = set()
-    bad: list[str] = []
-
-    def check(names: set) -> None:
-        for name in sorted(names):
-            if name in prior and name not in cleared and name not in bad:
-                bad.append(name)
-
-    for stmt in tree.body:
-        pre: set = set()
-        post: set = set()
-        binds: set = set()
-        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
-            binds = _import_names(stmt)
-        elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            pre, post = _function_reads(stmt, frozenset())
-            binds = {stmt.name}
-        elif isinstance(stmt, ast.ClassDef):
-            _global_reads(stmt, frozenset(), pre)
-            binds = {stmt.name}
-        elif isinstance(stmt, ast.Assign):
-            _global_reads(stmt, frozenset(), pre)
-            binds = set().union(*(_target_names(t) for t in stmt.targets))
-        elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
-            _global_reads(stmt, frozenset(), pre)
-            binds = _target_names(stmt.target)
-        elif isinstance(stmt, ast.For):
-            for part in (stmt.iter, stmt.target, *stmt.orelse):        # ``else`` also runs when nothing was bound
-                _global_reads(part, frozenset(), pre)
-            for part in stmt.body:
-                _global_reads(part, frozenset(), post)
-            binds = _target_names(stmt.target)
-        elif isinstance(stmt, ast.With):
-            for item in stmt.items:
-                _global_reads(item.context_expr, frozenset(), pre)
-                binds |= _target_names(item.optional_vars) if item.optional_vars is not None else set()
-            for part in stmt.body:
-                _global_reads(part, frozenset(), post)
-        else:
-            _global_reads(stmt, frozenset(), pre)
-        check(pre)
-        cleared |= binds
-        check(post)
-    return bad
+def _staging_parent_and_prefix() -> tuple[str, str]:
+    """Where a session kernel's staging dir (``mkdtemp(prefix=STAGING_DIR_PREFIX)``; ``sys.path[0]`` and, in strict
+    mode, the cwd) is created. Its random suffix is not known before the kernel exists, so any directory with that
+    prefix directly under the temp dir counts."""
+    try:
+        from tools.code_kernel import STAGING_DIR_PREFIX
+    except Exception:
+        STAGING_DIR_PREFIX = "hermes_kernel_"
+    import tempfile
+    return os.path.realpath(tempfile.gettempdir()), STAGING_DIR_PREFIX
 
 
 class _TildePath(str):
@@ -584,11 +405,9 @@ class _TildePath(str):
 
 class _Scanner(ast.NodeVisitor):
     def __init__(self, code: str, tree: ast.AST, *, write_roots: Sequence, cwd, deny_globs: Sequence[str],
-                 hermes_home, prior_bindings: frozenset = frozenset(), prior_chdir: bool = False) -> None:
+                 hermes_home) -> None:
         self.code = code
         self.tree = tree
-        self.prior_bindings = prior_bindings
-        self.prior_chdir = prior_chdir
         self.cwd = os.path.realpath(os.fspath(cwd)) if cwd else os.getcwd()
         self.roots = [
             r for r in (os.path.realpath(os.fspath(p)) for p in write_roots if p) if r not in ("/", "")
@@ -607,6 +426,7 @@ class _Scanner(ast.NodeVisitor):
         # Any OTHER dot entry directly under $HOME (~/.bashrc, ~/.config/x, ~/.gitconfig ...) is REVIEW
         # (``read:homedot``) and its key is not persistable: one grant must not cover every dotfile.
         self.dot_exempt = [os.path.realpath(os.path.join(home, ".hermes")), os.path.realpath(hermes)]
+        self.staging_parent, self.staging_prefix = _staging_parent_and_prefix()
         self.features: set[str] = set()
         self.review: list[str] = []
         self.high: list[str] = []
@@ -880,8 +700,26 @@ class _Scanner(ast.NodeVisitor):
         return False
 
     def _root_write_ok(self, path: str) -> bool:
-        """``path`` (as written) and where it really lands are both inside a root and neither is in ``.git``."""
-        return self._in_roots(os.path.realpath(path)) and not self._has_git_component(path)
+        """``path`` (as written) and where it really lands are both inside a root and neither is in ``.git``, and it
+        is not a file the interpreter would import or run."""
+        real = os.path.realpath(path)
+        return (self._in_roots(real) and not self._has_git_component(path)
+                and not self._import_path_write((path, real)))
+
+    def _import_path_write(self, candidates) -> bool:
+        """A file named like Python code or a startup hook (``.py`` / ``.pyc`` / ``.so`` / ``.pth`` ...) inside a
+        directory the interpreter imports from: the kernel's cwd and its staging dir (``sys.path[0]``). Writing one is
+        writing code that the NEXT import (``import json``, ``site``, a later cell, a Python started in that cwd) runs
+        with no further check, so it is never SAFE even though the directory is a write root."""
+        return any(p.lower().endswith(_IMPORT_SUFFIXES) and self._in_import_dir(p) for p in candidates)
+
+    def _in_import_dir(self, path: str) -> bool:
+        if path.startswith(self.cwd + os.sep):
+            return True
+        if path.startswith(self.staging_parent + os.sep):
+            first, sep, _ = path[len(self.staging_parent) + 1:].partition(os.sep)
+            return bool(sep) and first.startswith(self.staging_prefix)
+        return False
 
     def _home_dot_entry(self, path: str) -> bool:
         """A dotfile / dot-directory directly under $HOME (``~/.bashrc``, ``~/.config/x``) that is neither Hermes's own
@@ -937,6 +775,9 @@ class _Scanner(ast.NodeVisitor):
             return
         if in_roots:
             self.features.add("write:roots")
+            if self._import_path_write(candidates):
+                self.rev(node, IMPORT_PATH_FEATURE,
+                         f"{what}: writes Python code / a startup hook into a directory the interpreter imports from")
         else:
             self.rev(node, "write:outside", f"{what}: writes outside the write roots")
 
@@ -1531,14 +1372,6 @@ class _Scanner(ast.NodeVisitor):
 
     # -- finish ------------------------------------------------------------------------------------------------
     def finish(self) -> None:
-        # State left by earlier cells of the same kernel (see KernelScanState): the checks above assume a fresh
-        # interpreter, so a name an earlier cell bound is not the builtin / constant / import this program means.
-        if self.prior_chdir:
-            self.rev(self.tree, "state:chdir",
-                     "an earlier cell of this kernel may have changed the working directory or patched the interpreter")
-        tree = self.tree if isinstance(self.tree, ast.Module) else ast.Module(body=[], type_ignores=[])
-        for name in _prior_conflicts(tree, self.prior_bindings) if self.prior_bindings else ():
-            self.rev(self.tree, f"state:prior:{name}", f"{name} may have been rebound by an earlier cell of this kernel")
         if self.saw_decode and self.saw_exec:
             self.hi(self.tree, "obf:dynamic", "decoded data and dynamic execution in the same program")
         if self.db_write_lines:
@@ -1561,11 +1394,13 @@ class _Scanner(ast.NodeVisitor):
 
 
 def scan_python(code: str, *, write_roots: Sequence, cwd, deny_globs: Sequence[str] = (),
-                hermes_home=None, prior_bindings: frozenset = frozenset(), prior_chdir: bool = False) -> CodeScan:
+                hermes_home=None, kernel_fresh: bool = True) -> CodeScan:
     """Classify ``code`` as SAFE / REVIEW / HIGH. Never raises; any internal failure is REVIEW.
 
-    ``prior_bindings`` / ``prior_chdir`` describe the kernel the program will run in (a :class:`KernelScanState`);
-    leave them at their defaults only for a fresh interpreter, where the program is the first thing that runs."""
+    ``kernel_fresh`` is True when nothing has run yet in the interpreter the program will run in (a fresh interpreter,
+    or the first cell of a session kernel). When False a program that would be SAFE is REVIEW instead
+    (``state:prior-cell``): the allow-list assumes untouched builtins and an untouched cwd, which an earlier cell of the
+    same kernel may have changed. HIGH stays HIGH."""
     digest = _digest(code)
     opaque = frozenset({f"opaque:{digest}"})
     n_bytes = len(code.encode("utf-8", "surrogatepass"))
@@ -1577,12 +1412,10 @@ def scan_python(code: str, *, write_roots: Sequence, cwd, deny_globs: Sequence[s
         return CodeScan("review", opaque | {"syntax:error"}, (f"cannot parse with this interpreter: {type(exc).__name__}",))
     try:
         scanner = _Scanner(code, tree, write_roots=write_roots, cwd=cwd, deny_globs=deny_globs,
-                           hermes_home=hermes_home, prior_bindings=frozenset(prior_bindings or ()),
-                           prior_chdir=bool(prior_chdir))
+                           hermes_home=hermes_home)
         scanner.prepare()
         scanner.visit(tree)
         scanner.finish()
-        bindings = _module_bindings(tree)
     except Exception as exc:  # RecursionError on pathological nesting included
         logger.debug("code scan failed: %s: %s", type(exc).__name__, exc)
         return CodeScan("review", opaque | {"scan:error"}, (f"scan failed: {type(exc).__name__}",))
@@ -1596,8 +1429,12 @@ def scan_python(code: str, *, write_roots: Sequence, cwd, deny_globs: Sequence[s
         tier: Tier = "high"
     elif scanner.review or too_big:
         tier = "review"
+    elif not kernel_fresh:
+        tier = "review"
+        features.add(PRIOR_CELL_FEATURE)
+        reasons.append("an earlier cell already ran in this kernel; what it left behind is not tracked, so a person decides")
     else:
         tier = "safe"
     if tier != "safe" and too_big:
         features.add(f"opaque:{digest}")
-    return CodeScan(tier, frozenset(features), tuple(reasons[:_MAX_REASONS]), bindings)
+    return CodeScan(tier, frozenset(features), tuple(reasons[:_MAX_REASONS]))

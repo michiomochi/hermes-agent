@@ -36,8 +36,6 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
-from tools.approval_code_scan import CodeScan, KernelScanState
-
 logger = logging.getLogger(__name__)
 
 # A kernel's staging dir (and its child's cwd in strict mode) is ``mkdtemp(prefix=STAGING_DIR_PREFIX)`` inside the temp
@@ -298,9 +296,10 @@ class SessionKernel:
         self.raw, self.stderr = _BoundedBuffer(), _BoundedBuffer()
         self.execution_count, self.last_used = 0, time.monotonic()
         self.cell_authority: Optional[CellAuthority] = None
-        # What the cells that ran here left in the shared namespace, for the approval pre-screen. It belongs to this
-        # process: a replaced or killed kernel is a new SessionKernel and starts clean.
-        self.scan_state = KernelScanState()
+        # Cells handed to this interpreter, counted just BEFORE a cell is written to it (a half-run, failed or timed-out
+        # cell has changed the namespace too). The approval pre-screen rates a cell SAFE only while this is 0. It
+        # belongs to this process: a replaced or killed kernel is a new SessionKernel and starts at 0.
+        self.cells_started = 0
 
     def alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
@@ -819,14 +818,16 @@ def session_kernel_key(task_id: str, mode: str, child_python: str, child_cwd: st
     return (_resolve_owner(task_id) or "", mode, child_python, child_cwd, tuple(sorted(sandbox_tools)))
 
 
-def kernel_scan_state(key: tuple, *, reset: bool = False) -> KernelScanState:
-    """What the live kernel under *key* has had run in it (a clean state when there is none, or ``reset`` will
-    replace it): the input of the approval pre-screen for the next cell."""
+def kernel_ran_cells(key: tuple, *, reset: bool = False) -> bool:
+    """True when a live kernel under *key* has already been handed a cell, i.e. the next cell would NOT be the first
+    thing to run in its interpreter (False when there is no such kernel, or ``reset`` will replace it). Whatever an
+    earlier cell left behind (rebound builtins, a changed cwd, a patched module ...) is deliberately not tracked: the
+    approval pre-screen simply never rates a later cell SAFE."""
     if reset:
-        return KernelScanState()
+        return False
     with _REGISTRY.lock:
         kernel = _KERNELS.get(key)
-    return KernelScanState() if kernel is None or kernel.dead() else kernel.scan_state
+    return kernel is not None and not kernel.dead() and kernel.cells_started > 0
 
 
 class CellSectionInterrupted(Exception):
@@ -841,9 +842,10 @@ _SECTIONS_LOCK = threading.Lock()
 def kernel_cell_section(key: tuple, *, is_interrupted: Optional[Callable[[], bool]] = None) -> Iterator[None]:
     """Critical section for ONE cell of the kernel under *key*: pre-screen scan, approval and run.
 
-    The pre-screen judges a cell against the namespace earlier cells left. If a second cell could be scanned while the
-    first waits for its approval and then run before it, the first would run in a namespace its scan never saw. The
-    wait honours ``is_interrupted`` (raises :class:`CellSectionInterrupted`); other kernels never wait for this one.
+    The pre-screen rates a cell SAFE only if it is the first one the kernel runs (:func:`kernel_ran_cells`). If two
+    cells could both be scanned as "first" before either has run, both would be SAFE and the second would run in a
+    namespace its scan never saw. The wait honours ``is_interrupted`` (raises :class:`CellSectionInterrupted`);
+    other kernels never wait for this one.
     """
     with _SECTIONS_LOCK:
         entry = _SECTIONS.setdefault(key, [threading.RLock(), 0])
@@ -867,13 +869,9 @@ def kernel_cell_section(key: tuple, *, is_interrupted: Optional[Callable[[], boo
 def execute_in_session_kernel(
     code: str, *, task_id: str, mode: str, child_python: str, child_cwd: str,
     sandbox_tools: frozenset, timeout: int, max_tool_calls: int, reset: bool, is_interrupted,
-    cell_scan: Optional[CodeScan] = None,
 ) -> str:
     """Run one cell in the (owner, mode, python, cwd, tools) session kernel. The owner is the
-    session key (``_resolve_owner``), not the per-turn task id, so state survives across turns.
-
-    ``cell_scan`` is the approval pre-screen's scan of *code*; it is added to the kernel's scan state before the cell
-    runs. None (never scanned: approvals off / yolo / pre-screen off) marks the kernel as holding an unvouched cell."""
+    session key (``_resolve_owner``), not the per-turn task id, so state survives across turns."""
     key = session_kernel_key(task_id, mode, child_python, child_cwd, sandbox_tools)
     exec_start = time.monotonic()
     from agent.delegation_context import is_delegated_child_context
@@ -881,8 +879,7 @@ def execute_in_session_kernel(
     try:
         return _run_cell(kernel, key, code, task_id=task_id, child_python=child_python, child_cwd=child_cwd,
                          sandbox_tools=sandbox_tools, timeout=timeout, max_tool_calls=max_tool_calls,
-                         is_interrupted=is_interrupted, exec_start=exec_start, state_reset=state_reset,
-                         cell_scan=cell_scan)
+                         is_interrupted=is_interrupted, exec_start=exec_start, state_reset=state_reset)
     finally:
         with _REGISTRY.lock:
             kernel.attached -= 1
@@ -896,7 +893,7 @@ def execute_in_session_kernel(
 
 def _run_cell(kernel: SessionKernel, key: tuple, code: str, *, task_id: str, child_python: str,
               child_cwd: str, sandbox_tools: frozenset, timeout: int, max_tool_calls: int,
-              is_interrupted, exec_start: float, state_reset: bool, cell_scan: Optional[CodeScan] = None) -> str:
+              is_interrupted, exec_start: float, state_reset: bool) -> str:
     reused = kernel.proc is not None
     # Captured on the calling thread BEFORE the cell runs (the snapshot a per-call RPC thread
     # would get) and installed on the kernel so RPC dispatches under THIS cell's identity.
@@ -912,8 +909,7 @@ def _run_cell(kernel: SessionKernel, key: tuple, code: str, *, task_id: str, chi
             kernel.cell_log_start = len(kernel.tool_call_log)
             kernel.raw.drain(), kernel.stderr.drain()  # raw output leaked between cells belongs to no cell
             kernel.cell_authority = authority
-            # Recorded BEFORE the cell runs (and whatever its outcome): a half-run cell has left its names behind too.
-            kernel.scan_state = kernel.scan_state.after(cell_scan)
+            kernel.cells_started += 1  # BEFORE the write: whatever the cell's outcome, the namespace is no longer fresh
             kernel.proc.stdin.write((json.dumps({"id": uuid.uuid4().hex, "code": code}) + "\n").encode("utf-8"))
             kernel.proc.stdin.flush()
             status, payload = _await_cell(kernel, timeout, is_interrupted)

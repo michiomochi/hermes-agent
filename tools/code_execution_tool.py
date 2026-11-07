@@ -769,15 +769,20 @@ def execute_code(
     from tools.terminal_tool import _get_env_config
     _env_config = _get_env_config()
     env_type = _env_config["env_type"]
-    from tools.approval import code_prescreen_serialises_cells
-    if not code_prescreen_serialises_cells():
+    from tools.approval import code_prescreen_effective_mode
+    prescreen = code_prescreen_effective_mode()
+    if prescreen == "off":
         return _guard_and_run(code, task_id, enabled_tools, bool(reset), env_type, _env_config, None)
-    # The static pre-screen judges this cell against what the cells before it left in the kernel's namespace, so
-    # scanning, approving and running it is one critical section per kernel (a second cell scanned meanwhile could run
-    # first, in a namespace this cell's scan never saw).
+    # The static pre-screen rates a cell SAFE only if it is the first one its kernel runs, so the kernel is resolved
+    # once (the key read for that decision is the key the cell runs in).
+    plan = _kernel_plan(env_type, task_id, enabled_tools)
+    if prescreen != "on":
+        # shadow: the tier is only logged, nothing is decided, so parallel cells keep prompting independently.
+        return _guard_and_run(code, task_id, enabled_tools, bool(reset), env_type, _env_config, plan)
+    # on: "first cell" is read when the cell is scanned and acted on when it runs, so scan -> approval -> run is one
+    # critical section per kernel (a second cell scanned meanwhile would also see a kernel nobody has run in yet).
     from tools.interrupt import is_interrupted as _is_interrupted
     from tools.code_kernel import CellSectionInterrupted, kernel_cell_section
-    plan = _kernel_plan(env_type, task_id, enabled_tools)
     try:
         with kernel_cell_section(plan["key"], is_interrupted=_is_interrupted):
             return _guard_and_run(code, task_id, enabled_tools, bool(reset), env_type, _env_config, plan)
@@ -786,8 +791,8 @@ def execute_code(
 
 
 def _kernel_plan(env_type: str, task_id: Optional[str], enabled_tools: Optional[list[str]]) -> dict[str, Any]:
-    """Which kernel this cell will run in, resolved once so the pre-screen's state lookup, the critical section and the
-    run itself all use the same key: ``{"key", "cell"}`` where ``cell`` is the local kernel's
+    """Which kernel this cell will run in, resolved once so the pre-screen's "has a cell run here yet" lookup, the
+    critical section and the run itself all use the same key: ``{"key", "cell"}`` where ``cell`` is the local kernel's
     ``(mode, python, cwd, tools)`` (None for a remote backend)."""
     tools = frozenset(_sandbox_tools_for(enabled_tools))
     if env_type != "local":
@@ -801,8 +806,8 @@ def _kernel_plan(env_type: str, task_id: Optional[str], enabled_tools: Optional[
 
 def _guard_and_run(code: str, task_id: Optional[str], enabled_tools: Optional[list[str]], reset: bool,
                    env_type: str, env_config: dict[str, Any], plan: Optional[dict[str, Any]]) -> str:
-    """Approval guard, then the dispatch (local session kernel / remote backend). ``plan`` is set when the pre-screen
-    reads kernel state (see :func:`_kernel_plan`)."""
+    """Approval guard, then the dispatch (local session kernel / remote backend). ``plan`` (see :func:`_kernel_plan`)
+    is set when the static pre-screen is active."""
     from tools.terminal_tool import _docker_has_host_access
     # Arbitrary Python never passes through terminal()/DANGEROUS_PATTERNS, so guard the whole
     # script before either dispatch path spawns it — in this (tool-executor) thread, which holds
@@ -812,11 +817,12 @@ def _guard_and_run(code: str, task_id: Optional[str], enabled_tools: Optional[li
     guard_kwargs: dict[str, Any] = {}
     if plan is not None:
         if plan["cell"] is not None:
-            from tools.code_kernel import kernel_scan_state
-            guard_kwargs["kernel_state"] = kernel_scan_state(plan["key"], reset=reset)
+            from tools.code_kernel import kernel_ran_cells
+            ran = kernel_ran_cells(plan["key"], reset=reset)
         else:
-            from tools.code_kernel_remote import remote_kernel_scan_state
-            guard_kwargs["kernel_state"] = remote_kernel_scan_state(plan["key"], reset=reset)
+            from tools.code_kernel_remote import remote_kernel_ran_cells
+            ran = remote_kernel_ran_cells(plan["key"], reset=reset)
+        guard_kwargs["kernel_fresh"] = not ran
     _guard = check_execute_code_guard(code, env_type, has_host_access=_docker_has_host_access(env_config),
                                       task_id=task_id or "", **guard_kwargs)
     if not _guard.get("approved", False):
@@ -845,7 +851,7 @@ def _guard_and_run(code: str, task_id: Optional[str], enabled_tools: Optional[li
         code, task_id=task_id or "", mode=_mode, child_python=_python, child_cwd=_cwd, sandbox_tools=_tools,
         timeout=_cfg.get("timeout", DEFAULT_TIMEOUT),
         max_tool_calls=_cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS),
-        reset=reset, is_interrupted=_is_interrupted, cell_scan=_guard.get("code_scan"),
+        reset=reset, is_interrupted=_is_interrupted,
     ))
 
 

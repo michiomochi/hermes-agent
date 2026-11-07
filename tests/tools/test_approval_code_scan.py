@@ -550,10 +550,11 @@ def test_blocker3_percent_encoded_uri_path_is_never_safe(env):
 # One reproduction per finding. B1: trust in a program's own classes. B2: state a kernel keeps between cells.
 # S2: keys that were persistable although one grant covered several different effects.
 
-def _cell(env, code, *, prior=(), chdir=False):
+def _cell(env, code, *, fresh=True):
+    """Scan ``code`` as a cell of a session kernel: ``fresh`` is False once an earlier cell has run there."""
     code = code.replace("@S@", str(env.scratch)).replace("@H@", str(env.home))
     return scan_python(code, write_roots=[env.scratch], cwd=env.work, deny_globs=[], hermes_home=env.hermes,
-                       prior_bindings=frozenset(prior), prior_chdir=chdir)
+                       kernel_fresh=fresh)
 
 
 @pytest.mark.parametrize("code", [
@@ -610,81 +611,33 @@ def test_review3_b2_the_two_cell_attack_really_moves_the_file(env):
     assert (env.scratch / "moved.txt").exists() and not (env.home / "victim.txt").exists()
 
 
-def test_review3_b2_a_name_a_previous_cell_bound_is_not_trusted_as_the_builtin(env):
-    from tools.approval_code_scan import KernelScanState
-    cell1 = _cell(env, "import pathlib\nstr = pathlib.Path")
-    assert cell1.tier == "safe" and {"str", "pathlib"} <= set(cell1.top_level_bindings)
-    state = KernelScanState().after(cell1)
+def test_review3_b2_the_second_cell_of_a_kernel_is_never_safe(env):
+    """State carried between cells is not tracked; instead only the FIRST cell of a kernel may be SAFE. The second
+    cell of the attack above is SAFE in a fresh interpreter and REVIEW (not persistable) once a cell has run."""
     cell2 = "import pathlib\ncfg = pathlib.Path('@H@/victim.txt')\ndst = '@S@/moved.txt'\nstr(cfg).replace(dst)"
-    scan = _cell(env, cell2, prior=state.bindings, chdir=state.chdir_possible)
-    assert scan.tier != "safe" and "state:prior:str" in scan.features, (scan.reasons, sorted(scan.features))
-    # ...while the very same cell in a fresh kernel is still SAFE.
-    assert _cell(env, cell2).tier == "safe"
+    assert _cell(env, cell2, fresh=True).tier == "safe"
+    later = _cell(env, cell2, fresh=False)
+    assert later.tier == "review" and "state:prior-cell" in later.features, (later.reasons, sorted(later.features))
+    assert not capability_persistable(later)
 
 
-def test_review3_b2_a_cell_that_may_have_changed_the_cwd_is_never_safe(env):
-    assert _cell(env, "print(1)").tier == "safe"
-    scan = _cell(env, "print(1)", chdir=True)
-    assert scan.tier == "review" and "state:chdir" in scan.features, (scan.reasons, sorted(scan.features))
+@pytest.mark.parametrize("name, code", sorted(SAFE.items()))
+def test_review3_b2_no_program_the_scan_calls_safe_is_safe_after_a_cell_has_run(env, name, code):
+    assert _cell(env, code, fresh=True).tier == "safe", name
+    later = _cell(env, code, fresh=False)
+    assert later.tier == "review" and "state:prior-cell" in later.features, (name, later.reasons)
 
 
-@pytest.mark.parametrize("code, prior", [
-    ("y = x\nx = 'a'", {"x"}),                                   # read before the cell binds it: the OLD value
-    ("print(len('a'))", {"len"}),                                # a builtin the kernel rebound
-    ("def f():\n    return len('a')\nf()", {"len"}),             # ... read from inside a function
-    ("def f():\n    return x\nx = '@S@/a'\nf()", {"x"}),        # defined before the binding: not provably after it
-    ("if True:\n    n = 1\nprint(n)", {"n"}),                    # a conditional binding proves nothing
-    ("n += 1", {"n"}),
-    ("open(p, 'w')\np = '@S@/a'", {"p"}),                        # the folded constant is not what open() gets
-])
-def test_review3_b2_reading_a_prior_name_before_this_cell_binds_it_is_not_safe(env, code, prior):
-    scan = _cell(env, code, prior=prior)
-    assert scan.tier != "safe", (scan.reasons, sorted(scan.features))
-
-
-@pytest.mark.parametrize("code, prior", [
-    ("import json\nprint(json.dumps(1))", {"json"}),                          # re-import first
-    ("x = 1\nprint(x)", {"x"}),                                              # bind first
-    ("def f(data):\n    return len(data)\nprint(f([1]))", {"data", "f"}),    # parameters are local
-    ("for i in range(3):\n    print(i)", {"i"}),
-    ("with open('@S@/a', 'w') as fh:\n    fh.write('x')", {"fh"}),
-    ("print([i for i in range(2)])", {"i"}),
-    ("def fact(n):\n    return 1 if n < 2 else n * fact(n - 1)\nprint(fact(3))", {"fact", "n"}),
-    ("print(1)", {"unrelated"}),
-])
-def test_review3_b2_prior_names_the_cell_rebinds_or_never_reads_do_not_block_safe(env, code, prior):
-    scan = _cell(env, code, prior=prior)
-    assert scan.tier == "safe", (scan.reasons, sorted(scan.features))
-
-
-def test_review3_b2_top_level_bindings_cover_every_way_to_leave_a_name_in_the_namespace(env):
-    code = (
-        "import json, re as regex\nfrom collections import Counter as C\n"
-        "def f():\n    global g\n    g = 1\n"
-        "class K:\n    inner = 1\n"
-        "a = b = 1\nc, (d, *e) = 1, (2, 3)\nh: int = 1\nh += 1\n"
-        "for i in range(2):\n    pass\n"
-        "with open('@S@/x', 'w') as fh:\n    pass\n"
-        "if (w := 2):\n    pass\n"
-        "try:\n    pass\nexcept ValueError as err:\n    pass\n"
-        "del a\n"
-        "k = [z for z in range(2)]\n"
-    )
-    names = set(_cell(env, code).top_level_bindings)
-    assert {"json", "regex", "C", "f", "g", "K", "a", "b", "c", "d", "e", "h", "i", "fh", "w", "err", "k"} <= names
-    assert not ({"inner", "z"} & names)                  # class-body and comprehension names are not module names
-
-
-def test_review3_b2_kernel_scan_state_accumulates_and_an_unvouched_cell_may_have_moved_the_cwd(env):
-    from tools.approval_code_scan import KernelScanState
-    fresh = KernelScanState()
-    assert not fresh.bindings and not fresh.chdir_possible
-    safe = fresh.after(_cell(env, "x = 1"))
-    assert safe.bindings == frozenset({"x"}) and not safe.chdir_possible
-    assert safe.after(_cell(env, "y = 2")).bindings == frozenset({"x", "y"})
-    review = safe.after(_cell(env, "import os\nos.chdir('/')\nz = 1"))
-    assert review.chdir_possible and "z" in review.bindings and "x" in review.bindings
-    assert safe.after(None).chdir_possible                 # a cell that was never scanned
+def test_review3_b2_a_later_cell_keeps_its_own_findings_and_never_gets_a_shared_key(env):
+    """The state rule only turns SAFE into REVIEW: HIGH stays HIGH, REVIEW keeps its reasons, and the key of a later
+    cell differs from the key of the same program as a first cell (a grant for one never covers the other)."""
+    cred = "print(open('@H@/.hermes/.env').read())"
+    assert _cell(env, cred, fresh=False).tier == "high"
+    unvetted = "import os\nos.getpid()"
+    first, later = _cell(env, unvetted, fresh=True), _cell(env, unvetted, fresh=False)
+    assert first.tier == later.tier == "review" and "state:prior-cell" not in later.features
+    safe_first, safe_later = _cell(env, "print(1)", fresh=True), _cell(env, "print(1)", fresh=False)
+    assert capability_key(safe_first, "execute_code") != capability_key(safe_later, "execute_code")
 
 
 def test_review3_s2_outside_the_roots_sqlite_write_is_not_persistable_even_beside_root_writes(env):
@@ -721,3 +674,86 @@ def test_review3_s2_the_gated_terminal_tool_and_plain_reads_stay_persistable(env
 def test_review3_self_modifying_delete_is_reported_on_the_del_axis(env):
     scan = env.scan("from pathlib import Path\nPath('@H@/.hermes/config.yaml').unlink()")
     assert scan.tier == "high" and "del:outside" in scan.features and "delete:outside" not in scan.features
+
+
+# --- the import path ----------------------------------------------------------------------------------------------
+# A write root is not a safe place for CODE: the kernel imports from its staging dir (sys.path[0]; in strict mode also
+# its cwd) and a Python started in the cwd imports from there. A SAFE cell that drops ``json.py`` / ``x.pth`` there is
+# arbitrary code execution for whatever imports next, whether or not that next cell is ever scanned.
+
+@pytest.fixture
+def import_env(env, monkeypatch):
+    """Roots: the scratch dir (which is also ``tempfile.gettempdir()``, so staging dirs live in it) and the cwd."""
+    import tempfile
+    monkeypatch.setattr(tempfile, "tempdir", str(env.scratch))
+    staging = env.scratch / "hermes_kernel_abc123"
+    staging.mkdir()
+
+    def scan(code: str) -> CodeScan:
+        code = code.replace("@S@", str(env.scratch)).replace("@W@", str(env.work)).replace("@K@", str(staging))
+        return scan_python(code, write_roots=[env.scratch, env.work], cwd=env.work, deny_globs=[],
+                           hermes_home=env.hermes)
+
+    scan_in_staging = lambda code: scan_python(code, write_roots=[env.scratch], cwd=staging, deny_globs=[],
+                                               hermes_home=env.hermes)
+    return type("ImportEnv", (), {"scan": staticmethod(scan), "scan_in_staging": staticmethod(scan_in_staging),
+                                  "work": env.work, "staging": staging})
+
+
+@pytest.mark.parametrize("code", [
+    "open('@W@/json.py', 'w').write('print(1)')",                                   # absolute, in the cwd
+    "open('json.py', 'w').write('print(1)')",                                       # relative to the cwd
+    "open('pkg/helper.py', 'w').write('')",                                         # a package below the cwd
+    "from pathlib import Path\nPath('@W@/sitecustomize.py').write_text('print(1)')",
+    "from pathlib import Path\nPath('@W@/evil.pth').write_text('import os')",
+    "from pathlib import Path\nPath('@W@/x.pyc').write_bytes(b'')",
+    "from pathlib import Path\nPath('@W@/EVIL.PY').write_text('')",                # the check is case-blind
+    "from pathlib import Path\nPath('@W@/ext.cpython-312-x86_64-linux-gnu.so').write_bytes(b'')",
+    "open('@K@/json.py', 'w').write('print(1)')",                                    # the kernel's staging dir
+    "open('@K@/sub/mod.py', 'w').write('print(1)')",
+    "from pathlib import Path\nPath('@S@/a.txt').rename('@W@/moved.py')",             # a move that lands as code
+    "from hermes_tools import write_file\nwrite_file('@W@/tool.py', 'print(1)')",
+])
+def test_import_path_a_python_file_in_the_cwd_or_staging_dir_is_never_safe(import_env, code):
+    scan = import_env.scan(code)
+    assert scan.tier == "review" and "write:import-path" in scan.features, (code, scan.reasons, sorted(scan.features))
+    assert not capability_persistable(scan)
+
+
+def test_import_path_a_sqlite_database_named_like_code_is_not_safe_either(import_env):
+    scan = import_env.scan("import sqlite3\nc = sqlite3.connect('@W@/db.py')\nc.execute('CREATE TABLE t(x)')")
+    assert scan.tier == "review" and not capability_persistable(scan), (scan.reasons, sorted(scan.features))
+
+
+def test_import_path_strict_mode_cwd_is_the_staging_dir(import_env):
+    scan = import_env.scan_in_staging("open('json.py', 'w').write('print(1)')")
+    assert scan.tier == "review" and "write:import-path" in scan.features, (scan.reasons, sorted(scan.features))
+    assert import_env.scan_in_staging("open('notes.txt', 'w').write('x')").tier == "safe"
+
+
+@pytest.mark.parametrize("code", [
+    "open('@W@/notes.txt', 'w').write('x')",                    # data in the cwd: still a plain root write
+    "open('@W@/data.json', 'w').write('{}')",
+    "open('@S@/tool.py', 'w').write('print(1)')",               # code in a root that is not an import directory
+    "open('@S@/pkg/helper.py', 'w').write('')",
+    "open('@W@/mod.py').read()",                                # reading it is fine
+    "import sqlite3\nc = sqlite3.connect('@W@/x.db')\nc.execute('CREATE TABLE t(x)')",
+])
+def test_import_path_everything_else_in_the_roots_stays_safe(import_env, code):
+    scan = import_env.scan(code)
+    assert scan.tier == "safe", (code, scan.reasons, sorted(scan.features))
+
+
+def test_import_path_hijack_really_runs_in_the_next_interpreter(import_env, tmp_path):
+    """The premise, run for real: a file named ``json.py`` written by a program the scan used to call SAFE is what the
+    next Python started in that directory imports."""
+    import subprocess
+    import sys
+    code = "open('json.py', 'w').write('print(\"hijacked\")\\nloads = dumps = None')"
+    assert import_env.scan_in_staging(code).tier != "safe"
+    work = tmp_path / "victim_cwd"
+    work.mkdir()
+    exec(compile(code, "<cell>", "exec"), {"open": lambda p, m: open(work / p, m)})
+    out = subprocess.run([sys.executable, "-c", "import json"], check=False, cwd=work,
+                         capture_output=True, text=True)
+    assert out.stdout.strip() == "hijacked"

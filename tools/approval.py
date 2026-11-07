@@ -1432,12 +1432,12 @@ def _code_write_roots(cwd: str) -> list[str]:
     return seen
 
 
-def _code_prescreen(code: str, task_id: str = "", kernel_state=None):
+def _code_prescreen(code: str, task_id: str = "", kernel_fresh: bool = True):
     """``(CodeScan | None, write_roots)``; logs ``code_prescreen tier=…`` for shadow-mode measurement. A failure here
     must never change an approval, so it returns ``(None, [])`` and the caller behaves as if the pre-screen were off.
 
-    ``kernel_state`` (``approval_code_scan.KernelScanState``) is what earlier cells of the session kernel this program
-    will run in left behind; None means a fresh interpreter."""
+    ``kernel_fresh`` is False when an earlier cell already ran in the session kernel this program will run in: such a
+    program is never SAFE (``approval_code_scan.scan_python``)."""
     try:
         from hermes_constants import get_hermes_home
         from tools.approval_code_scan import capability_key, scan_python
@@ -1445,10 +1445,8 @@ def _code_prescreen(code: str, task_id: str = "", kernel_state=None):
         cwd = _code_scan_cwd(task_id)
         roots = _code_write_roots(cwd)
         deny = approval_context._get_approval_config().get("deny") or []
-        prior = {} if kernel_state is None else {
-            "prior_bindings": kernel_state.bindings, "prior_chdir": kernel_state.chdir_possible}
         scan = scan_python(code, write_roots=roots, cwd=cwd, deny_globs=list(deny) if isinstance(deny, (list, tuple)) else [],
-                           hermes_home=get_hermes_home(), **prior)
+                           hermes_home=get_hermes_home(), kernel_fresh=kernel_fresh)
         logger.info("code_prescreen tier=%s mode=%s key=%s reasons=%d", scan.tier, _code_prescreen_mode(),
                     capability_key(scan, "execute_code"), len(scan.reasons))
         return scan, roots
@@ -1486,25 +1484,26 @@ def _is_local_viewer_turn() -> bool:
             and _gateway_notify_cb(get_current_session_key()) is not None)
 
 
-def code_prescreen_serialises_cells() -> bool:
-    """True when the static pre-screen can decide an execute_code cell (smart mode, ``code_prescreen`` not off).
+def code_prescreen_effective_mode() -> str:
+    """``off`` | ``shadow`` | ``on``: what the static pre-screen does to an execute_code cell right now (it only runs in
+    smart mode, so any other approval mode is ``off``).
 
-    The scan reads the namespace the earlier cells of the kernel left behind, so scanning, approving and running a cell
-    must not interleave with another cell of the same kernel (see ``code_kernel.kernel_cell_section``). Without the
-    pre-screen nothing reads that state and parallel cells keep prompting independently."""
+    Only ``on`` lets the pre-screen decide a cell, and only then must scanning, approving and running a cell of one
+    kernel not interleave with another cell of that kernel (see ``code_kernel.kernel_cell_section``): "SAFE only for
+    the first cell of a kernel" is read at scan time and acted on at run time. ``shadow`` only logs, so parallel cells
+    keep prompting independently, exactly as with the pre-screen ``off``."""
     try:
-        return approval_context._get_approval_mode() == "smart" and _code_prescreen_mode() != "off"
+        return _code_prescreen_mode() if approval_context._get_approval_mode() == "smart" else "off"
     except Exception:
-        return False
+        return "off"
 
 
 def check_execute_code_guard(code: str, env_type: str, has_host_access: bool = False, task_id: str = "",
-                             kernel_state=None) -> dict:
+                             kernel_fresh: bool = True) -> dict:
     """Approve an execute_code script before its child process is spawned.
 
-    ``kernel_state`` is the ``KernelScanState`` of the session kernel the cell will run in (None: a fresh
-    interpreter). When the pre-screen scanned the cell, the result carries the scan as ``code_scan`` so the caller can
-    add the cell to the kernel's state once it has run.
+    ``kernel_fresh`` is False when an earlier cell already ran in the session kernel this script will run in; the
+    static pre-screen never rates such a cell SAFE (it only knows how to read a program in an untouched interpreter).
 
     The script can call ``subprocess``/``os.system``/``ctypes`` directly, none of which pass
     through ``terminal()`` / ``DANGEROUS_PATTERNS``; in gateway/ask contexts we fail closed by
@@ -1518,14 +1517,6 @@ def check_execute_code_guard(code: str, env_type: str, has_host_access: bool = F
     arbitrary code headlessly without any approval surface is trusted-by-config (set a gateway/ask surface
     or ``approvals.cron_mode`` to require approval). See #30882.
     """
-    scans: list = []
-    result = _check_execute_code_guard(code, env_type, has_host_access, task_id, kernel_state, scans)
-    return {**result, "code_scan": scans[0]} if scans and isinstance(result, dict) else result
-
-
-def _check_execute_code_guard(code: str, env_type: str, has_host_access: bool, task_id: str, kernel_state,
-                              scans: list) -> dict:
-    """Body of :func:`check_execute_code_guard`; appends the pre-screen's scan (if one ran) to ``scans``."""
     pattern_key = "execute_code"
     description = _EXECUTE_CODE_DESCRIPTION
 
@@ -1570,9 +1561,7 @@ def _check_execute_code_guard(code: str, env_type: str, has_host_access: bool, t
     # through without the guardian, keys approvals by capability class and sends a HIGH program to a person.
     smart = approval_mode == "smart"
     prescreen_mode = _code_prescreen_mode() if smart else "off"
-    scan, write_roots = _code_prescreen(code, task_id, kernel_state) if prescreen_mode != "off" else (None, [])
-    if scan is not None:
-        scans.append(scan)
+    scan, write_roots = _code_prescreen(code, task_id, kernel_fresh) if prescreen_mode != "off" else (None, [])
     smart_extra = None
     persist_allowed = True
     no_persist = False

@@ -872,7 +872,7 @@ def test_blocker6_guard_hands_the_task_id_to_the_scan(prescreen, monkeypatch):
     seen = []
     real = A._code_prescreen
     monkeypatch.setattr(A, "_code_prescreen",
-                        lambda code, task_id="", kernel_state=None: (seen.append(task_id), real(code, task_id, kernel_state))[1])
+                        lambda code, task_id="", kernel_fresh=True: (seen.append(task_id), real(code, task_id, kernel_fresh))[1])
     assert A.check_execute_code_guard(SAFE_PROGRAM, "local", task_id="t1")["approved"] is True
     assert seen == ["t1"]
 
@@ -966,6 +966,17 @@ def real_kernel(prescreen, monkeypatch, tmp_path):
             with patch("tools.code_execution_tool._load_config", return_value={"mode": "strict", "timeout": 30}):
                 return json.loads(execute_code(code, task_id="review3", **kw))
 
+        @staticmethod
+        def run_parallel(*codes):
+            """One conversation, all cells at once (the config patch is entered once: it is not thread-safe)."""
+            def one(code):
+                return json.loads(execute_code(code, task_id="review3"))
+
+            with patch("tools.code_execution_tool._load_config", return_value={"mode": "strict", "timeout": 30}):
+                with concurrent.futures.ThreadPoolExecutor(len(codes)) as pool:
+                    futures = [pool.submit(contextvars.copy_context().run, one, code) for code in codes]
+                    return [f.result(60) for f in futures]
+
     Ctl.outside.mkdir()
     yield Ctl
     code_kernel.shutdown_all_kernels()
@@ -973,43 +984,72 @@ def real_kernel(prescreen, monkeypatch, tmp_path):
 
 def test_review3_b2_a_name_rebound_by_an_earlier_cell_cannot_launder_a_move(real_kernel, prescreen, monkeypatch):
     """cell 1: ``str = pathlib.Path`` (SAFE). cell 2: ``str(cfg).replace(dst)`` (SAFE in a fresh interpreter, because
-    ``str`` reads as the string type). In ONE kernel namespace the second cell moved ~/victim to the scratch dir."""
+    ``str`` reads as the string type). In ONE kernel namespace the second cell moved ~/victim to the scratch dir.
+    Run for real: the first cell of the kernel is SAFE, the second is never SAFE and reaches the reviewer."""
     victim, dst = real_kernel.outside / "victim.txt", real_kernel.scratch / "moved.txt"
     victim.write_text("precious")
     calls = _guardian(monkeypatch, "escalate")
     _register_resolver(prescreen.session, "deny")
     cell2 = (f"import pathlib\ncfg = pathlib.Path({str(victim)!r})\ndst = {str(dst)!r}\n"
              "str(cfg).replace(dst)")
+    assert A._code_prescreen(cell2)[0].tier == "safe"           # on its own, in a fresh interpreter, it passes
 
     first = real_kernel.run("import pathlib\nstr = pathlib.Path")
     assert first["status"] == "success" and not calls            # SAFE: statically approved, no guardian
     second = real_kernel.run(cell2)
 
-    assert len(calls) == 1 and calls[0]["static_summary"]["tier"] != "safe"     # it reached a reviewer ...
+    assert len(calls) == 1 and calls[0]["static_summary"]["tier"] == "review"      # it reached a reviewer ...
+    assert "state:prior-cell" in calls[0]["static_summary"]["features"]
     assert second["status"] == "error"                                         # ... who (here) said no
     assert victim.read_text() == "precious" and not dst.exists()
 
 
-def test_review3_b2_the_same_cell_in_a_fresh_kernel_is_still_safe(real_kernel, prescreen, monkeypatch):
+def test_review3_b2_only_the_first_cell_of_a_kernel_is_safe(real_kernel, prescreen, monkeypatch):
     calls = _guardian(monkeypatch, "escalate")
     _register_resolver(prescreen.session, "deny")
-    assert real_kernel.run("y = 1")["status"] == "success"
-    assert real_kernel.run("print(sum([1, 2]))")["status"] == "success"          # no shared names: still SAFE
-    assert real_kernel.run("y = 2\nprint(y)")["status"] == "success"            # re-binding before reading: SAFE
-    assert not calls
+    assert real_kernel.run("y = 1")["status"] == "success" and not calls          # first cell of the kernel: SAFE
+    # Nothing in the second cell shares a name with the first, and it is SAFE in a fresh interpreter: it still asks.
+    assert real_kernel.run("print(sum([1, 2]))")["status"] == "error" and len(calls) == 1
+    assert calls[0]["static_summary"]["tier"] == "review"
+    assert "state:prior-cell" in calls[0]["static_summary"]["features"]
+    # reset=true throws the interpreter away: the next cell is the first of a new kernel again.
+    assert real_kernel.run("print(2)", reset=True)["status"] == "success" and len(calls) == 1
+    assert real_kernel.run("print(3)")["status"] == "error" and len(calls) == 2
 
 
-def test_review3_b2_a_cell_that_was_not_statically_safe_ends_safe_for_the_rest_of_that_kernel(
+def test_review3_b2_a_denied_or_failed_cell_still_counts_as_having_run(real_kernel, prescreen, monkeypatch):
+    """The cell that raised changed the namespace as far as it got: the kernel is no longer fresh."""
+    calls = _guardian(monkeypatch, "escalate")
+    _register_resolver(prescreen.session, "deny")
+    failing = real_kernel.run("str = len\nraise ValueError('boom')")
+    assert failing["status"] == "error" and not calls                             # ran (SAFE as the first cell), failed
+    assert real_kernel.run("print(1)")["status"] == "error" and len(calls) == 1   # a later cell asks
+
+
+def test_review3_b2_a_cell_that_was_not_statically_safe_makes_the_rest_of_that_kernel_reviewed(
         real_kernel, prescreen, monkeypatch):
     calls = _guardian(monkeypatch, "approve")             # the reviewer lets the unvetted cell through
     assert real_kernel.run("import os\nos.chdir('/')")["status"] == "success"
     assert len(calls) == 1
-    # Whatever it did (chdir, patching a module ...) is not something the scan can see, so a program that would
-    # otherwise be SAFE now asks the reviewer too ...
+    # Whatever it did (chdir, patching a module ...) is not something the scan can see: a program that would
+    # otherwise be SAFE asks the reviewer too ...
     assert real_kernel.run("print(1)")["status"] == "success" and len(calls) == 2
-    assert calls[1]["static_summary"]["tier"] == "review" and "state:chdir" in calls[1]["static_summary"]["features"]
-    # ... until the state is thrown away: reset=true starts from an interpreter nobody has touched.
+    assert calls[1]["static_summary"]["tier"] == "review" and "state:prior-cell" in calls[1]["static_summary"]["features"]
+    # ... until the state is thrown away.
     assert real_kernel.run("print(2)", reset=True)["status"] == "success" and len(calls) == 2
+
+
+def test_review3_b2_a_cell_run_with_the_prescreen_off_counts_too(real_kernel, prescreen, monkeypatch):
+    """The count is the kernel's own, not the scan's: a cell that was never scanned (pre-screen ``off``) still makes
+    the next scanned cell a later cell."""
+    calls = _guardian(monkeypatch, "approve")
+    prescreen.mode("off")
+    assert real_kernel.run("str = len")["status"] == "success"
+    prescreen.mode("on")
+    assert real_kernel.run("print(1)")["status"] == "success"
+    # (with the pre-screen off the first cell went to the guardian too, without a static summary)
+    assert calls[0]["static_summary"] is None
+    assert calls[-1]["static_summary"]["tier"] == "review" and "state:prior-cell" in calls[-1]["static_summary"]["features"]
 
 
 def test_review3_b2_the_state_belongs_to_the_kernel_not_to_the_conversation(real_kernel, prescreen, monkeypatch):
@@ -1083,18 +1123,67 @@ def test_review3_b2_waiting_for_the_section_honours_an_interrupt():
         holder.join(5)
 
 
-def test_review3_b2_execute_code_hands_the_kernels_prior_state_to_the_guard(prescreen, monkeypatch):
-    from tools.approval_code_scan import KernelScanState
-    from tools.code_execution_tool import execute_code
+def test_review3_b2_execute_code_tells_the_guard_whether_a_cell_has_run_in_the_kernel(real_kernel, monkeypatch):
+    from tools import approval as approval_mod
     seen = []
+    real_guard = approval_mod.check_execute_code_guard
 
-    def guard(code, env_type, has_host_access=False, task_id="", kernel_state=None):
-        seen.append(kernel_state)
-        return {"approved": False, "message": "stop"}
+    def guard(code, env_type, has_host_access=False, task_id="", **kw):
+        seen.append(kw)
+        return real_guard(code, env_type, has_host_access=has_host_access, task_id=task_id, **kw)
 
     monkeypatch.setattr("tools.approval.check_execute_code_guard", guard)
-    execute_code(code="print(1)", task_id="review3-state")
-    assert seen and isinstance(seen[0], KernelScanState) and seen[0] == KernelScanState()   # no kernel yet: fresh
+    _guardian(monkeypatch, "approve")
+    real_kernel.run("print(1)")                 # no kernel yet
+    real_kernel.run("print(2)")                 # the kernel exists and has run a cell
+    real_kernel.run("print(3)", reset=True)     # ... and is replaced
+    assert seen == [{"kernel_fresh": True}, {"kernel_fresh": False}, {"kernel_fresh": True}]
+
+
+@pytest.mark.parametrize("mode, expected_overlap", [("on", 1), ("shadow", 2)])
+def test_review3_b2_only_the_on_mode_serialises_the_cells_of_one_kernel(real_kernel, prescreen, monkeypatch,
+                                                                         mode, expected_overlap):
+    """``on`` acts on "first cell of the kernel", which is read at scan time and used at run time, so two cells of
+    one kernel must not be in the guard at once. ``shadow`` only logs: parallel cells must not wait for each other."""
+    from tools import approval as approval_mod
+    prescreen.mode(mode)
+    _guardian(monkeypatch, "approve")
+    real_guard = approval_mod.check_execute_code_guard
+    inside, peak, lock = [0], [0], threading.Lock()
+
+    def guard(*args, **kw):
+        with lock:
+            inside[0] += 1
+            peak[0] = max(peak[0], inside[0])
+        try:
+            time.sleep(0.4)                      # long enough for the other cell to reach the guard too
+            return real_guard(*args, **kw)
+        finally:
+            with lock:
+                inside[0] -= 1
+
+    monkeypatch.setattr("tools.approval.check_execute_code_guard", guard)
+    results = real_kernel.run_parallel("print(0)", "print(1)")
+    assert [r["status"] for r in results] == ["success", "success"]
+    assert peak[0] == expected_overlap
+
+
+def test_review3_b2_two_parallel_first_cells_are_not_both_safe(real_kernel, prescreen, monkeypatch):
+    calls = _guardian(monkeypatch, "approve")
+    assert [r["status"] for r in real_kernel.run_parallel("print(0)", "print(1)")] == ["success", "success"]
+    assert len(calls) == 1                       # exactly one of the two was the first cell
+
+
+def test_review3_import_path_a_safe_first_cell_cannot_plant_code_in_the_kernels_staging_dir(
+        real_kernel, prescreen, monkeypatch):
+    """Strict mode: the cell's cwd is the kernel's staging dir, which is ``sys.path[0]`` and inside a write root.
+    ``json.py`` written there would be imported by whatever runs next; it must reach a reviewer instead."""
+    calls = _guardian(monkeypatch, "escalate")
+    _register_resolver(prescreen.session, "deny")
+    result = real_kernel.run("open('json.py', 'w').write('print(\"planted\")')")
+    assert result["status"] == "error"                                            # never ran
+    assert len(calls) == 1 and "write:import-path" in calls[0]["static_summary"]["features"]
+    assert not list(real_kernel.scratch.glob("hermes_kernel_*/json.py"))
 
 
 def test_review3_s1_strict_mode_scans_where_the_kernel_really_starts(child_cwd, monkeypatch):

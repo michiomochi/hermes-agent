@@ -163,16 +163,15 @@ def remote_kernel_key(env_type: str, task_env_id: str, sandbox_tools: frozenset)
     return _kernel_key(_resolve_owner(task_env_id), env_type, task_env_id, sandbox_tools)
 
 
-def remote_kernel_scan_state(key: tuple, *, reset: bool = False):
-    """Approval pre-screen input for a remote kernel. Its namespace lives on another host and falls open to a fresh
-    per-call interpreter when the kernel cannot be reached, so what ran in it is not tracked: a kernel that already
-    exists is simply assumed to hold unvouched state (nothing in it is SAFE until ``reset``)."""
-    from tools.approval_code_scan import KernelScanState
+def remote_kernel_ran_cells(key: tuple, *, reset: bool = False) -> bool:
+    """True when a remote kernel already exists under *key* (``reset`` will replace it: False). Its namespace lives on
+    another host and falls open to a fresh per-call interpreter when it cannot be reached, so nothing about it is
+    tracked: an existing kernel is simply assumed to have run cells, and the approval pre-screen rates no later cell
+    SAFE until ``reset``."""
     if reset:
-        return KernelScanState()
+        return False
     with _REGISTRY.lock:
-        present = key in _REMOTE_KERNELS
-    return KernelScanState(chdir_possible=present)
+        return key in _REMOTE_KERNELS
 
 
 # Registry + lock shared-shape with code_kernel; teardown runs outside the lock.
