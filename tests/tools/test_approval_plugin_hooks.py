@@ -246,7 +246,28 @@ class TestSmartModeFiresHooks:
             result = guard(value, "local")
 
         assert result["approved"] is True
-        assert force_values == [True, True]
+        # The two observer payload fields (command, description) are redacted with force=True. Any other
+        # redact_sensitive_text call is a log handler's formatter redacting an INFO record (e.g. the
+        # "code_prescreen tier=…" measurement line) when an earlier test left a handler installed.
+        assert [force for force in force_values if force] == [True, True]
+
+    def test_static_prescreen_approval_fires_post_hook_with_decided_by(self, isolated_session, monkeypatch):
+        """A program the static pre-screen approves never reaches the guardian; observers still see who decided."""
+        self._configure(monkeypatch, "deny")           # would block if the guardian were consulted
+        monkeypatch.setattr(approval_context, "_get_approval_config", lambda: {"code_prescreen": "on"})
+        captured = []
+        with patch(
+            "hermes_cli.plugins.invoke_hook",
+            side_effect=lambda name, **kwargs: captured.append((name, kwargs)),
+        ):
+            result = check_execute_code_guard("print('Authorization: Bearer sk-live-abcdefghijklmnop')", "local")
+
+        assert result["approved"] is True and result["static_approved"] is True
+        assert [name for name, _ in captured] == ["post_approval_response"]
+        kwargs = captured[0][1]
+        assert kwargs["choice"] == "static_approve" and kwargs["decided_by"] == "static_prescreen"
+        assert kwargs["pattern_key"].startswith("execute_code:cap:")
+        assert "sk-live-abcdefghijklmnop" not in kwargs["command"]       # forced redaction, like the guardian hooks
 
     @pytest.mark.parametrize("guard,value", [
         (check_all_command_guards, "rm -rf /tmp/smart-hook-crash"),

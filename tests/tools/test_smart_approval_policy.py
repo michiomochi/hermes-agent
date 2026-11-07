@@ -132,5 +132,81 @@ class TestSmartApprovePolicyInjection(unittest.TestCase):
         assert "TimeoutError" in str(args)
 
 
+SUMMARY = {"tier": "review", "features": ["net:none", "proc:gated"], "reasons": ["open() path not constant at line 3"]}
+ROOTS = ["/scratch/dir", "/home/u/.hermes/profiles/dev/cache"]
+
+
+class TestCodeReviewerPrompt(unittest.TestCase):
+    """With Hermes's static analysis attached, a Python program is judged by the code-specific reviewer.
+
+    The trust split must survive the new prompt: operator policy and the allowed roots (real paths Hermes resolved)
+    are on the SYSTEM side; the static summary and the program are UNTRUSTED/derived and stay on the USER side.
+    """
+
+    def _run(self, mock_call_llm, mock_cfg, *, policy=POLICY_TEXT, code="print(1)", summary=SUMMARY, roots=ROOTS):
+        mock_call_llm.return_value = _make_response("APPROVE")
+        mock_cfg.return_value = {"smart_policy": policy}
+        verdict = _smart_approve("execute_code", "d", code=code, static_summary=summary, allowed_roots=roots)
+        messages = _messages_from(mock_call_llm)
+        return verdict, messages[0]["content"], messages[1]["content"]
+
+    @patch("tools.approval_context._get_approval_config")
+    @patch("agent.auxiliary_client.call_llm")
+    def test_uses_the_code_prompt_with_policy_and_roots_on_the_system_side(self, mock_call_llm, mock_cfg):
+        from tools.approval_smart import _CODE_SYSTEM_PROMPT
+
+        verdict, system, user = self._run(mock_call_llm, mock_cfg)
+        assert verdict == "approve"
+        assert system.startswith(_CODE_SYSTEM_PROMPT)
+        assert "PYTHON" in system and "terminal()" in system
+        assert "Additional policy rules from the operator" in system and POLICY_TEXT in system
+        for root in ROOTS:
+            assert f"- {root}" in system
+        # The allowed roots come before the operator's rules, and neither leaks to the user channel.
+        assert system.index("Allowed roots") < system.index("Additional policy rules from the operator")
+        assert POLICY_TEXT not in user and "Allowed roots" not in user and "/scratch/dir" not in user
+
+    @patch("tools.approval_context._get_approval_config")
+    @patch("agent.auxiliary_client.call_llm")
+    def test_roots_are_listed_even_without_an_operator_policy(self, mock_call_llm, mock_cfg):
+        _, system, _ = self._run(mock_call_llm, mock_cfg, policy="")
+        assert "Allowed roots" in system and "Additional policy rules" not in system
+
+    @patch("tools.approval_context._get_approval_config")
+    @patch("agent.auxiliary_client.call_llm")
+    def test_no_roots_says_so(self, mock_call_llm, mock_cfg):
+        _, system, _ = self._run(mock_call_llm, mock_cfg, roots=[])
+        assert "- (none)" in system
+
+    @patch("tools.approval_context._get_approval_config")
+    @patch("agent.auxiliary_client.call_llm")
+    def test_user_message_carries_summary_then_fenced_code(self, mock_call_llm, mock_cfg):
+        _, _, user = self._run(mock_call_llm, mock_cfg, code="x = 1  # note\n")
+        assert user.startswith("Hermes static analysis (computed by Hermes from the code, not written by the agent):")
+        assert '"tier":"review"' in user and '"features":["net:none","proc:gated"]' in user
+        assert user.index("static analysis") < user.index("<code>") < user.index("x = 1") < user.index("</code>")
+        assert "# note" not in user          # Python comments are stripped with tokenize
+        assert user.rstrip().endswith("Answer on the FIRST line with exactly one word: APPROVE, DENY, or ESCALATE.")
+
+    @patch("tools.approval_context._get_approval_config")
+    @patch("agent.auxiliary_client.call_llm")
+    def test_without_a_summary_the_old_prompt_is_unchanged(self, mock_call_llm, mock_cfg):
+        from tools.approval_smart import _CODE_SYSTEM_PROMPT, _SYSTEM_PROMPT
+
+        mock_call_llm.return_value = _make_response("ESCALATE")
+        mock_cfg.return_value = {}
+        _smart_approve("execute_code", "d", code="print(1)")
+        system = _messages_from(mock_call_llm)[0]["content"]
+        assert system == _SYSTEM_PROMPT and _CODE_SYSTEM_PROMPT not in system
+        assert "Allowed roots" not in system
+
+    @patch("tools.approval_context._get_approval_config")
+    @patch("agent.auxiliary_client.call_llm")
+    def test_max_tokens_and_reasoning_are_untouched(self, mock_call_llm, mock_cfg):
+        self._run(mock_call_llm, mock_cfg)
+        assert mock_call_llm.call_args.kwargs["max_tokens"] == 16
+        assert mock_call_llm.call_args.kwargs["temperature"] == 0
+
+
 if __name__ == "__main__":
     unittest.main()

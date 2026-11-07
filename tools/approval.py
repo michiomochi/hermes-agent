@@ -494,6 +494,7 @@ def load_permanent_allowlist() -> set:
     try:
         patterns = _read_permanent_allowlist()
         load_permanent(patterns)
+        _warn_legacy_execute_code_key(patterns)
         with _lock:
             _permanent_baseline_by_home[_baseline_key()] = set(patterns)
         return patterns
@@ -601,7 +602,7 @@ def _gateway_notify_cb(session_key: str):
 
 def _pending_result(spec, session_key: str, *, command: str, description: str,
                     pattern_key: str, pattern_keys: list[str], body: str | None,
-                    smart_denied: bool) -> dict:
+                    smart_denied: bool, persist_allowed: bool = True) -> dict:
     """Queue an approval nobody can answer right now (no gateway notifier, no CLI panel) for
     ``/approve`` / ``/deny`` review. Command/code gates return the backward-compatible
     ``pending_approval`` shape (``pattern_keys`` + STOP text); the action gate ``approval_required``."""
@@ -611,6 +612,8 @@ def _pending_result(spec, session_key: str, *, command: str, description: str,
     pending["description"] = description
     if smart_denied:
         pending.update(smart_denied=True, allow_permanent=False)
+    elif not persist_allowed:
+        pending.update(allow_permanent=False, allow_session=False)
     submit_pending(session_key, pending)
     if not spec.pending_keys:
         return {
@@ -632,6 +635,8 @@ def _pending_result(spec, session_key: str, *, command: str, description: str,
     }
     if smart_denied:
         result.update(smart_denied=True, allow_permanent=False)
+    elif not persist_allowed:
+        result.update(allow_permanent=False, allow_session=False)
     return result
 
 
@@ -843,7 +848,9 @@ _ACTION_GATE = _GateSpec(
 
 def _smart_gate(spec: _GateSpec, command: str, description: str, pattern_key: str,
                 pattern_keys: list[str], session_key: str, *,
-                human_present: bool, smart_code: str | None = None) -> tuple[dict | None, bool]:
+                human_present: bool, smart_code: str | None = None,
+                smart_extra: dict | None = None,
+                human_on_approve: bool = False) -> tuple[dict | None, bool]:
     """Guardian-LLM step -> ``(result, smart_denied_for_owner)``: a result ends the gate;
     ``smart_denied_for_owner`` means an interactive owner may still override the DENY for this
     one operation (once/deny only, nothing persists).
@@ -852,9 +859,16 @@ def _smart_gate(spec: _GateSpec, command: str, description: str, pattern_key: st
     command suppress review of later commands in the same broad detector category. A DENY
     counts toward the denial breaker even when an owner may override it. ESCALATE follows the
     normal, potentially persistent manual behavior.
+
+    ``smart_extra`` is forwarded to the guardian (static-analysis summary, allowed roots).
+    ``human_on_approve``: the static pre-screen rated this HIGH, so an APPROVE is not enough and the
+    gate falls through to a human (the caller already removed session/always from that prompt).
     """
     verdict = _smart_verdict(command, description, pattern_key, pattern_keys, session_key,
-                             code=smart_code)
+                             code=smart_code, **(smart_extra or {}))
+    if verdict == "approve" and human_on_approve:
+        logger.info("Smart approval: guardian approved a HIGH-risk program; asking the user anyway (%s)", pattern_key)
+        return None, False
     if verdict == "approve":
         _reset_denials(session_key)
         logger.debug(spec.smart_log.format(command=command[:60], description=description, session_key=session_key))
@@ -878,12 +892,18 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
                     pattern_key: str, pattern_keys: list[str],
                     session_key: str, approval_callback, is_cli: bool, is_gateway: bool,
                     is_ask: bool, smart: bool = False, pending_body=None,
-                    smart_code: str | None = None) -> dict:
+                    smart_code: str | None = None, smart_extra: dict | None = None,
+                    persist_allowed: bool = True) -> dict:
     """Ask a human (after the optional guardian-LLM step) and turn the answer into the gate result.
 
     ``pattern_keys`` are what :func:`_persist_choice` stores on session/always; a smart-DENY
     owner override reduces every surface to once/deny and persists nothing. ``pending_body`` is a thunk, built only once a human is
     actually asked, so a smart APPROVE never pays for redacting a large script.
+
+    ``persist_allowed=False`` (the static pre-screen rated the program HIGH) does the same for any
+    human prompt of this gate AND stops a guardian APPROVE from ending the gate: a HIGH program
+    always reaches a person, as one operation. ``smart_extra`` carries the pre-screen's summary and
+    allowed roots to the guardian.
     """
     from agent.redact import redact_approval_display
 
@@ -891,11 +911,13 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
     if smart:
         result, smart_denied = _smart_gate(spec, command, description, pattern_key, pattern_keys,
                                            session_key, human_present=is_cli or is_gateway or is_ask,
-                                           smart_code=smart_code)
+                                           smart_code=smart_code, smart_extra=smart_extra,
+                                           human_on_approve=not persist_allowed)
         if result is not None:
             return result
     pending_body = pending_body() if pending_body else None
-    allow_permanent = not smart_denied
+    once_only = smart_denied or not persist_allowed
+    allow_permanent = not once_only
 
     def deny(template: str, outcome: str, **fmt) -> dict:
         breaker = ""
@@ -908,8 +930,9 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
                        outcome=outcome, noun=spec.noun, **extra)
 
     def grant(choice: str) -> dict:
-        # A smart-DENY owner override is always one operation, even if an older client returns "session" or "always".
-        if not smart_denied:
+        # A smart-DENY owner override (or a HIGH static rating) is always one operation, even if an older client
+        # returns "session" or "always".
+        if not once_only:
             _persist_choice(session_key, choice, pattern_keys)
         if spec.user_approved:
             return _user_approved(session_key, description)
@@ -918,7 +941,7 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
     if spec.transport:
         attempt = _present_with_selected_transport(
             command=command, description=description, pattern_key=pattern_key, pattern_keys=pattern_keys,
-            session_key=session_key, allow_session=not smart_denied, allow_permanent=allow_permanent,
+            session_key=session_key, allow_session=not once_only, allow_permanent=allow_permanent,
             surface=approval_context.gateway_approval_surface() if (is_gateway or is_ask) else "cli",
         )
         choice, denied = _transport_choice(attempt, pattern_key=pattern_key, description=description)
@@ -944,11 +967,13 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
             data = {
                 "command": display_command, "pattern_key": pattern_key,
                 "pattern_keys": pattern_keys, "description": display_description,
-                "allow_permanent": not smart_denied,
-                "allow_session": not smart_denied,
+                "allow_permanent": not once_only,
+                "allow_session": not once_only,
             }
             if smart_denied:
                 data["smart_denied"] = True
+            elif not persist_allowed:
+                data["persist_allowed"] = False
             decision = _await_gateway_decision(session_key, notify_cb, data, surface="gateway")
             if decision.get("notify_failed"):
                 return _denied(spec.notify_failed, pattern_key=pattern_key,
@@ -984,6 +1009,7 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
             return _pending_result(
                 spec, session_key, command=display_command, description=display_description, pattern_key=pattern_key,
                 pattern_keys=pattern_keys, body=pending_body, smart_denied=smart_denied,
+                persist_allowed=persist_allowed,
             )
 
     # CLI interactive: single combined prompt, wrapped in the pre/post plugin hooks.
@@ -995,7 +1021,8 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
                        pattern_keys=list(pattern_keys), session_key=session_key, surface="cli")
     approval_context._fire_approval_hook("pre_approval_request", **hook_kwargs)
     choice = prompt_dangerous_approval(prompt_command, prompt_description, allow_permanent=allow_permanent,
-                                       smart_denied=smart_denied, approval_callback=approval_callback)
+                                       smart_denied=smart_denied, approval_callback=approval_callback,
+                                       **({"allow_session": False} if not persist_allowed else {}))
     approval_context._fire_approval_hook("post_approval_response", **hook_kwargs, choice=choice)
     if choice == "timeout":
         return deny(spec.cli_timeout, "timeout")
@@ -1294,6 +1321,129 @@ _EXECUTE_CODE_DESCRIPTION = (
 )
 
 
+# Used instead of the text above when the static pre-screen is ``on``: it tells the guardian (and the person) what is
+# and is not covered by the per-call terminal() approvals.
+_EXECUTE_CODE_DESCRIPTION_PRESCREENED = (
+    "Python program run by execute_code on the host. terminal() calls inside it are "
+    "approved separately per call; direct subprocess/os/socket/ctypes use and file I/O "
+    "are NOT — judge those from the code."
+)
+# Before capability keys, one blanket key covered every script. It is still honoured for non-HIGH programs.
+_LEGACY_EXECUTE_CODE_KEY = "execute_code"
+_CODE_PRESCREEN_MODES = ("off", "shadow", "on")
+
+
+def _code_prescreen_mode() -> str:
+    """``approvals.code_prescreen``: off | shadow (default) | on. Unquoted YAML ``off``/``on`` arrive as booleans."""
+    raw = approval_context._get_approval_config().get("code_prescreen", "shadow")
+    if raw is False:
+        return "off"
+    if raw is True:
+        return "on"
+    mode = str(raw).strip().lower() if raw is not None else "shadow"
+    return mode if mode in _CODE_PRESCREEN_MODES else "shadow"
+
+
+def _warn_legacy_execute_code_key(patterns) -> None:
+    """The pre-capability blanket key keeps working for non-HIGH programs; say so once it matters."""
+    try:
+        if _LEGACY_EXECUTE_CODE_KEY in patterns and _code_prescreen_mode() == "on":
+            logger.warning(
+                "command_allowlist contains the legacy blanket key 'execute_code', which approves every non-HIGH "
+                "script. With approvals.code_prescreen: on, remove it and let capability-scoped keys replace it."
+            )
+    except Exception:
+        pass
+
+
+def _git_worktree_root(start: str) -> str | None:
+    """Root of the linked git worktree containing ``start`` (a ``.git`` *file*), else None. The primary checkout
+    (``.git`` directory) is deliberately not a write root."""
+    current = os.path.abspath(start)
+    while True:
+        marker = os.path.join(current, ".git")
+        if os.path.isfile(marker):
+            return current
+        if os.path.isdir(marker):
+            return None
+        parent = os.path.dirname(current)
+        if parent == current:
+            return None
+        current = parent
+
+
+def _code_scan_cwd() -> str:
+    """Working directory a project-mode script starts in (same ladder as the code-execution child)."""
+    try:
+        from agent.runtime_cwd import scope_terminal_cwd
+        raw = scope_terminal_cwd().strip()
+    except Exception:
+        raw = ""
+    for candidate in (os.path.expanduser(raw) if raw else "", os.getcwd()):
+        if candidate and os.path.isdir(candidate):
+            return candidate
+    return os.getcwd()
+
+
+def _code_write_roots(cwd: str) -> list[str]:
+    """Where a SAFE program may write: ``$TMPDIR`` (the profile scratch dir), ``<hermes home>/cache``, the
+    linked git worktree of the cwd, and ``approvals.code_write_roots``. The filesystem root is never accepted."""
+    from hermes_constants import get_hermes_home
+
+    roots: list[str] = []
+    if os.environ.get("TMPDIR"):
+        roots.append(os.environ["TMPDIR"])
+    roots.append(os.path.join(os.fspath(get_hermes_home()), "cache"))
+    worktree = _git_worktree_root(cwd)
+    if worktree:
+        roots.append(worktree)
+    configured = approval_context._get_approval_config().get("code_write_roots") or []
+    if isinstance(configured, (list, tuple)):
+        roots.extend(os.path.expanduser(r) for r in configured if isinstance(r, str) and r.strip())
+    seen: list[str] = []
+    for root in roots:
+        real = os.path.realpath(root)
+        if real != os.sep and real not in seen:
+            seen.append(real)
+    return seen
+
+
+def _code_prescreen(code: str):
+    """``(CodeScan | None, write_roots)``; logs ``code_prescreen tier=…`` for shadow-mode measurement. A failure here
+    must never change an approval, so it returns ``(None, [])`` and the caller behaves as if the pre-screen were off."""
+    try:
+        from hermes_constants import get_hermes_home
+        from tools.approval_code_scan import capability_key, scan_python
+
+        cwd = _code_scan_cwd()
+        roots = _code_write_roots(cwd)
+        deny = approval_context._get_approval_config().get("deny") or []
+        scan = scan_python(code, write_roots=roots, cwd=cwd, deny_globs=list(deny) if isinstance(deny, (list, tuple)) else [],
+                           hermes_home=get_hermes_home())
+        logger.info("code_prescreen tier=%s mode=%s key=%s reasons=%d", scan.tier, _code_prescreen_mode(),
+                    capability_key(scan, "execute_code"), len(scan.reasons))
+        return scan, roots
+    except Exception as exc:
+        logger.warning("code_prescreen failed (%s: %s); continuing without it", type(exc).__name__, exc)
+        return None, []
+
+
+def _static_approved(session_key: str, command: str, description: str, pattern_key: str) -> dict:
+    """One-shot approval of a program the static pre-screen rated SAFE. Nothing is persisted."""
+    _reset_denials(session_key)
+    try:
+        from agent.redact import redact_sensitive_text
+        approval_context._fire_approval_hook(
+            "post_approval_response",
+            command=redact_sensitive_text(command, force=True),
+            description=description, pattern_key=pattern_key, pattern_keys=[pattern_key],
+            session_key=session_key, surface="static", choice="static_approve", decided_by="static_prescreen",
+        )
+    except Exception as exc:  # observability only
+        logger.debug("static pre-screen hook skipped: %s", exc)
+    return {"approved": True, "message": None, "static_approved": True, "description": description}
+
+
 def _is_local_viewer_turn() -> bool:
     """A local session's turn its viewer submitted, with that viewer there to answer: its frozen launch policy is
     local-interactive, the admission is the viewer's own prompt (not a plugin injection or another producer
@@ -1362,9 +1512,28 @@ def check_execute_code_guard(code: str, env_type: str, has_host_access: bool = F
     # Built only past the early-return gates so common paths don't copy a potentially-large script into this string.
     command = f"execute_code <<'PY'\n{code}\nPY"
 
+    # Static pre-screen (smart mode only): ``shadow`` logs the tier and changes nothing; ``on`` lets a SAFE program
+    # through without the guardian, keys approvals by capability class and sends a HIGH program to a person.
+    smart = approval_mode == "smart"
+    prescreen_mode = _code_prescreen_mode() if smart else "off"
+    scan, write_roots = _code_prescreen(code) if prescreen_mode != "off" else (None, [])
+    smart_extra = None
+    persist_allowed = True
+    if scan is not None and prescreen_mode == "on":
+        from tools.approval_code_scan import capability_key, scan_summary
+        pattern_key = capability_key(scan, "execute_code")
+        description = _EXECUTE_CODE_DESCRIPTION_PRESCREENED
+        if scan.tier == "safe":
+            return _static_approved(session_key, command, description, pattern_key)
+        if scan.tier == "high":
+            # HIGH is never satisfied by a stored grant (legacy blanket key included) and never creates one.
+            persist_allowed = False
+        elif is_approved(session_key, pattern_key) or is_approved(session_key, _LEGACY_EXECUTE_CODE_KEY):
+            return _approved()
+        smart_extra = {"static_summary": scan_summary(scan), "allowed_roots": write_roots}
     # Without this, "Approve session" / "Always" choices are stored but never
     # consulted, so every execute_code call re-prompts (#39275).
-    if is_approved(session_key, pattern_key):
+    elif is_approved(session_key, pattern_key):
         return _approved()
 
     # Smart mode: an APPROVE only suppresses the redundant whole-script prompt; the per-call terminal() guards still
@@ -1375,7 +1544,7 @@ def check_execute_code_guard(code: str, env_type: str, has_host_access: bool = F
         _EXECUTE_CODE_GATE, command=command, description=description, pattern_key=pattern_key,
         pattern_keys=[pattern_key], session_key=session_key,
         approval_callback=approval_callback, is_cli=is_cli, is_gateway=is_gateway, is_ask=is_ask,
-        smart=approval_mode == "smart", smart_code=code,
+        smart=smart, smart_code=code, smart_extra=smart_extra, persist_allowed=persist_allowed,
         pending_body=lambda: f"**Code:**\n```python\n{redact_approval_display(code)}\n```",
     )
 

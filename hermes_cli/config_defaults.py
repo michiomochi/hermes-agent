@@ -1667,6 +1667,15 @@ DEFAULT_CONFIG = {
         # Extra rules appended to the smart-approval guardian's SYSTEM prompt, e.g. "Always ESCALATE
         # commands touching /etc".
         "smart_policy": "",
+        # Static pre-screen of execute_code programs (smart mode). off: nothing; shadow (default): classify
+        # each program SAFE/REVIEW/HIGH and log "code_prescreen tier=…" without changing any decision; on: a SAFE
+        # program is approved once without calling the guardian, a HIGH program always reaches a person (once/deny
+        # only), and session/always grants are keyed by capability class instead of one blanket execute_code key.
+        # Quote it in YAML ("off"/"on"): unquoted they are booleans (still understood).
+        "code_prescreen": "shadow",
+        # Extra directories a SAFE program may write under, on top of $TMPDIR, <profile>/cache and the git
+        # worktree of the working directory.
+        "code_write_roots": [],
         # After this many consecutive guardian DENYs in a session, the deny message escalates to a
         # hard-stop (report to user / ask for /approve). Approval resets; 0 off.
         "denial_breaker_threshold": 3,

@@ -3148,6 +3148,27 @@ approvals:
     APPROVE docker compose restarts in ~/deploys — they are routine here.
 ```
 
+### Static pre-screen for `execute_code`
+
+In smart mode, `approvals.code_prescreen` classifies every `execute_code` program with a deterministic, allow-list-based static analysis before the reviewer LLM is asked. It is a filter, not a security boundary: it can approve a program once or raise its severity, never lower a reviewer DENY.
+
+```yaml
+approvals:
+  code_prescreen: shadow        # off | shadow (default) | on — quote "off"/"on" in YAML
+  code_write_roots: []          # extra directories a SAFE program may write under
+```
+
+| Tier | Meaning | With `code_prescreen: on` |
+|---|---|---|
+| `safe` | Every import, name, call and file path is recognised; reads are not credential-like; writes stay under the write roots (`$TMPDIR`, `<profile>/cache`, the linked git worktree of the working directory, `code_write_roots`). | Approved once, without calling the reviewer. Nothing is remembered. |
+| `review` | Something is not recognised (an `os` import, a path that is not a constant, an `f"…"` URL, …). | Reviewer LLM, then a person, as before. The reviewer also receives the static summary and the allowed roots. |
+| `high` | A concrete risk: reading `.env`/`auth.json`/`~/.ssh`/token files, dumping `os.environ`, deleting outside the write roots, decoded-then-executed strings, writing Hermes's own config or source, a `subprocess`/`os.system` command that the dangerous-command detectors flag, or anything matching `approvals.deny`. | Always reaches a person, even if the reviewer says APPROVE — as once/deny only (no session/always). |
+
+- `shadow` (default) only logs `code_prescreen tier=… key=…`; decisions are unchanged. Use `grep "code_prescreen tier="` in `agent.log` to see how many programs `on` would handle without the reviewer.
+- With `on`, session/always approvals are keyed by capability class (`execute_code:cap:net:none|proc:gated|write:roots`), so approving one kind of script no longer approves every script. The old blanket `execute_code` key is still honoured for non-`high` programs; remove it from `command_allowlist` when you switch to `on`.
+- `approvals.deny` globs are matched against the paths a program touches and against the text of each call, so a deny rule now covers `execute_code` bodies too (they only guarded `terminal` commands before).
+- Applies to `execute_code` only, and only in `smart` mode. If the scan itself fails, the old behaviour applies.
+
 
 ## Checkpoints
 
