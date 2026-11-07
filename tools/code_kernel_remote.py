@@ -157,6 +157,24 @@ def _kernel_key(owner: str, env_type: str, task_env_id: str, sandbox_tools: froz
     return (owner, "remote", env_type, task_env_id, tuple(sorted(sandbox_tools)))
 
 
+def remote_kernel_key(env_type: str, task_env_id: str, sandbox_tools: frozenset) -> tuple:
+    """Registry key of the remote kernel a cell for this task would use (``task_env_id`` as in the executor)."""
+    from tools.code_kernel import _resolve_owner
+    return _kernel_key(_resolve_owner(task_env_id), env_type, task_env_id, sandbox_tools)
+
+
+def remote_kernel_scan_state(key: tuple, *, reset: bool = False):
+    """Approval pre-screen input for a remote kernel. Its namespace lives on another host and falls open to a fresh
+    per-call interpreter when the kernel cannot be reached, so what ran in it is not tracked: a kernel that already
+    exists is simply assumed to hold unvouched state (nothing in it is SAFE until ``reset``)."""
+    from tools.approval_code_scan import KernelScanState
+    if reset:
+        return KernelScanState()
+    with _REGISTRY.lock:
+        present = key in _REMOTE_KERNELS
+    return KernelScanState(chdir_possible=present)
+
+
 # Registry + lock shared-shape with code_kernel; teardown runs outside the lock.
 _REGISTRY = KernelRegistry(lambda kernel: kernel.kill())
 _REMOTE_KERNELS: dict[tuple, RemoteKernel] = _REGISTRY.kernels

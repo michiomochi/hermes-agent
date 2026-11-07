@@ -19,6 +19,7 @@ import concurrent.futures
 import contextvars
 import json
 import threading
+import time
 
 import pytest
 
@@ -862,14 +863,16 @@ def test_blocker6_strict_mode_scans_in_the_staging_dir_not_the_session_cwd(child
     from tools import code_execution_tool
     monkeypatch.setattr(code_execution_tool, "_get_execution_mode", lambda: "strict")
     child_cwd.cd("t1", child_cwd.home)
-    assert os.path.realpath(A._code_scan_cwd("t1")) == os.path.realpath(tempfile.gettempdir())
+    # (the staging dir is one level below the temp dir: see test_review3_s1_*)
+    assert os.path.dirname(A._code_scan_cwd("t1")) == os.path.realpath(tempfile.gettempdir())
 
 
 def test_blocker6_guard_hands_the_task_id_to_the_scan(prescreen, monkeypatch):
     _guardian(monkeypatch, "approve")
     seen = []
     real = A._code_prescreen
-    monkeypatch.setattr(A, "_code_prescreen", lambda code, task_id="": (seen.append(task_id), real(code, task_id))[1])
+    monkeypatch.setattr(A, "_code_prescreen",
+                        lambda code, task_id="", kernel_state=None: (seen.append(task_id), real(code, task_id, kernel_state))[1])
     assert A.check_execute_code_guard(SAFE_PROGRAM, "local", task_id="t1")["approved"] is True
     assert seen == ["t1"]
 
@@ -878,7 +881,7 @@ def test_blocker6_execute_code_passes_its_task_id_to_the_guard(monkeypatch):
     from tools.code_execution_tool import execute_code
     seen = {}
 
-    def guard(code, env_type, has_host_access=False, task_id=""):
+    def guard(code, env_type, has_host_access=False, task_id="", **_):
         seen["task_id"] = task_id
         return {"approved": False, "message": "stop"}
 
@@ -933,3 +936,217 @@ def test_fine_grained_capability_can_still_be_granted_for_the_session(prescreen,
     assert shown["approval_data"]["allow_session"] is True
     assert A.check_execute_code_guard(SAME_CAPABILITY, "local").get("approved") is True
     assert len(calls) == 1
+
+
+# --- review round 3 ---------------------------------------------------------------------------------------------
+
+@pytest.fixture
+def real_kernel(prescreen, monkeypatch, tmp_path):
+    """Smart mode + pre-screen ``on`` in front of a REAL session kernel (strict mode, staging dirs in the scratch
+    dir, which is also the only write root). ``run(code, **kw)`` is ``execute_code`` for one conversation."""
+    import tempfile
+    from unittest.mock import patch
+
+    from tools import code_kernel
+    from tools.code_execution_tool import execute_code
+
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(prescreen.scratch_dir))
+    code_kernel.shutdown_all_kernels()
+
+    class Ctl:
+        scratch = prescreen.scratch_dir
+        home = tmp_path / "home"
+        outside = tmp_path / "outside"
+
+        @staticmethod
+        def run(code, **kw):
+            with patch("tools.code_execution_tool._load_config", return_value={"mode": "strict", "timeout": 30}):
+                return json.loads(execute_code(code, task_id="review3", **kw))
+
+    Ctl.outside.mkdir()
+    yield Ctl
+    code_kernel.shutdown_all_kernels()
+
+
+def test_review3_b2_a_name_rebound_by_an_earlier_cell_cannot_launder_a_move(real_kernel, prescreen, monkeypatch):
+    """cell 1: ``str = pathlib.Path`` (SAFE). cell 2: ``str(cfg).replace(dst)`` (SAFE in a fresh interpreter, because
+    ``str`` reads as the string type). In ONE kernel namespace the second cell moved ~/victim to the scratch dir."""
+    victim, dst = real_kernel.outside / "victim.txt", real_kernel.scratch / "moved.txt"
+    victim.write_text("precious")
+    calls = _guardian(monkeypatch, "escalate")
+    _register_resolver(prescreen.session, "deny")
+    cell2 = (f"import pathlib\ncfg = pathlib.Path({str(victim)!r})\ndst = {str(dst)!r}\n"
+             "str(cfg).replace(dst)")
+
+    first = real_kernel.run("import pathlib\nstr = pathlib.Path")
+    assert first["status"] == "success" and not calls            # SAFE: statically approved, no guardian
+    second = real_kernel.run(cell2)
+
+    assert len(calls) == 1 and calls[0]["static_summary"]["tier"] != "safe"     # it reached a reviewer ...
+    assert second["status"] == "error"                                         # ... who (here) said no
+    assert victim.read_text() == "precious" and not dst.exists()
+
+
+def test_review3_b2_the_same_cell_in_a_fresh_kernel_is_still_safe(real_kernel, prescreen, monkeypatch):
+    calls = _guardian(monkeypatch, "escalate")
+    _register_resolver(prescreen.session, "deny")
+    assert real_kernel.run("y = 1")["status"] == "success"
+    assert real_kernel.run("print(sum([1, 2]))")["status"] == "success"          # no shared names: still SAFE
+    assert real_kernel.run("y = 2\nprint(y)")["status"] == "success"            # re-binding before reading: SAFE
+    assert not calls
+
+
+def test_review3_b2_a_cell_that_was_not_statically_safe_ends_safe_for_the_rest_of_that_kernel(
+        real_kernel, prescreen, monkeypatch):
+    calls = _guardian(monkeypatch, "approve")             # the reviewer lets the unvetted cell through
+    assert real_kernel.run("import os\nos.chdir('/')")["status"] == "success"
+    assert len(calls) == 1
+    # Whatever it did (chdir, patching a module ...) is not something the scan can see, so a program that would
+    # otherwise be SAFE now asks the reviewer too ...
+    assert real_kernel.run("print(1)")["status"] == "success" and len(calls) == 2
+    assert calls[1]["static_summary"]["tier"] == "review" and "state:chdir" in calls[1]["static_summary"]["features"]
+    # ... until the state is thrown away: reset=true starts from an interpreter nobody has touched.
+    assert real_kernel.run("print(2)", reset=True)["status"] == "success" and len(calls) == 2
+
+
+def test_review3_b2_the_state_belongs_to_the_kernel_not_to_the_conversation(real_kernel, prescreen, monkeypatch):
+    from tools import code_kernel
+    calls = _guardian(monkeypatch, "approve")
+    real_kernel.run("import os\nos.chdir('/')")
+    assert len(calls) == 1
+    code_kernel.shutdown_all_kernels()                    # the kernel dies (idle reaper, crash, /new ...)
+    assert real_kernel.run("print(1)")["status"] == "success" and len(calls) == 1     # fresh kernel: SAFE again
+
+
+def test_review3_b2_a_denied_cell_leaves_no_trace_in_the_state(real_kernel, prescreen, monkeypatch):
+    _guardian(monkeypatch, "escalate")
+    _register_resolver(prescreen.session, "deny")
+    denied = real_kernel.run("import os\nos.chdir('/')")
+    assert denied["status"] == "error"                    # never ran
+    calls = _guardian(monkeypatch, "escalate")
+    assert real_kernel.run("print(1)")["status"] == "success" and not calls
+
+
+def test_review3_b2_cells_of_one_kernel_are_scanned_and_run_one_at_a_time(real_kernel, monkeypatch):
+    """Cell A is scanned against the state before it; if cell B could be scanned meanwhile and then run first, A would
+    run in a namespace its scan never saw. So scan -> approval -> run is one critical section per kernel."""
+    from tools import code_kernel
+    key = ("owner", "strict", "python", "", ())
+    order, gate = [], threading.Event()
+
+    def cell(name):
+        with code_kernel.kernel_cell_section(key, is_interrupted=lambda: False):
+            order.append(f"{name}-in")
+            if name == "a":
+                gate.wait(2)
+            order.append(f"{name}-out")
+
+    ta, tb = threading.Thread(target=cell, args=("a",)), threading.Thread(target=cell, args=("b",))
+    ta.start()
+    deadline = time.monotonic() + 5
+    while "a-in" not in order and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert order == ["a-in"]
+    tb.start()
+    tb.join(0.3)
+    assert order == ["a-in"]                              # b waits while a holds the section
+    gate.set()
+    ta.join(5)
+    tb.join(5)
+    assert order == ["a-in", "a-out", "b-in", "b-out"]
+    with code_kernel.kernel_cell_section(("other",), is_interrupted=lambda: False):       # other kernels never wait
+        pass
+
+
+def test_review3_b2_waiting_for_the_section_honours_an_interrupt():
+    from tools import code_kernel
+    key = ("owner-i", "strict", "python", "", ())
+    release, held = threading.Event(), threading.Event()
+
+    def hold():
+        with code_kernel.kernel_cell_section(key, is_interrupted=lambda: False):
+            held.set()
+            release.wait(5)
+
+    holder = threading.Thread(target=hold)
+    holder.start()
+    held.wait(2)
+    try:
+        with pytest.raises(code_kernel.CellSectionInterrupted):
+            with code_kernel.kernel_cell_section(key, is_interrupted=lambda: True):
+                pytest.fail("entered the section while another cell holds it")
+    finally:
+        release.set()
+        holder.join(5)
+
+
+def test_review3_b2_execute_code_hands_the_kernels_prior_state_to_the_guard(prescreen, monkeypatch):
+    from tools.approval_code_scan import KernelScanState
+    from tools.code_execution_tool import execute_code
+    seen = []
+
+    def guard(code, env_type, has_host_access=False, task_id="", kernel_state=None):
+        seen.append(kernel_state)
+        return {"approved": False, "message": "stop"}
+
+    monkeypatch.setattr("tools.approval.check_execute_code_guard", guard)
+    execute_code(code="print(1)", task_id="review3-state")
+    assert seen and isinstance(seen[0], KernelScanState) and seen[0] == KernelScanState()   # no kernel yet: fresh
+
+
+def test_review3_s1_strict_mode_scans_where_the_kernel_really_starts(child_cwd, monkeypatch):
+    """The kernel's cwd is ``mkdtemp(prefix='hermes_kernel_')`` INSIDE the temp dir, one level below it."""
+    import os
+    import tempfile
+    from tools import code_execution_tool
+    monkeypatch.setattr(code_execution_tool, "_get_execution_mode", lambda: "strict")
+    cwd = A._code_scan_cwd("t1")
+    assert os.path.dirname(cwd) == os.path.realpath(tempfile.gettempdir())
+    assert os.path.basename(cwd).startswith("hermes_kernel_")
+
+
+def test_review3_s1_a_relative_path_climbing_out_of_the_staging_dir_is_not_safe(prescreen, monkeypatch, tmp_path):
+    import os
+    import tempfile
+    from tools import code_execution_tool
+    home = tmp_path / "home"
+    scratch = home / "scratch"                              # $TMPDIR below $HOME, as in a profile's scratch dir
+    scratch.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("TMPDIR", str(scratch))
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
+    monkeypatch.setattr(code_execution_tool, "_get_execution_mode", lambda: "strict")
+    # staging dir = <scratch>/hermes_kernel_x  ->  '../..' is $HOME, so this reads ~/.bash_history
+    program = f"print(open({'../' * 2 + '.bash_history'!r}).read())"
+    scan, _ = A._code_prescreen(program, "t1")
+    assert scan.tier != "safe" and "read:homedot" in scan.features, (scan.reasons, sorted(scan.features))
+    # An ordinary relative file in the staging dir is still a root write.
+    scan, _ = A._code_prescreen("open('notes.txt', 'w').write('x')", "t1")
+    assert scan.tier == "safe", (scan.reasons, sorted(scan.features))
+    assert os.path.realpath(A._code_scan_cwd("t1")).startswith(os.path.realpath(str(scratch)) + os.sep)
+
+
+@pytest.mark.parametrize("first, second", [
+    pytest.param("import sqlite3\nsqlite3.connect('@H@/.hermes/state.db').execute('DELETE FROM sessions')",
+                 "import sqlite3\nsqlite3.connect('@H@/other.db').execute('DELETE FROM sessions')",
+                 id="sqlite-write-outside-the-roots"),
+    pytest.param("print(open('@H@/.bashrc').read())", "print(open('@H@/.gitconfig').read())", id="home-dotfile-read"),
+    pytest.param("import subprocess\nsubprocess.run(['git', 'status'])",
+                 "import subprocess\nsubprocess.run(['ls', '/etc'])", id="constant-process-command"),
+])
+def test_review3_s2_one_approval_never_covers_a_different_effect(prescreen, monkeypatch, tmp_path, first, second):
+    """Each pair used to share ONE capability key, so "approve for the session" on the first passed the second."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    first, second = first.replace("@H@", str(tmp_path)), second.replace("@H@", str(tmp_path))
+    calls = _guardian(monkeypatch, "escalate")
+    shown = _register_capturing_resolver(prescreen.session, "session")
+    assert A.check_execute_code_guard(first, "local").get("user_approved") is True
+    assert shown["approval_data"]["allow_session"] is False and shown["approval_data"]["allow_permanent"] is False
+    assert not A.is_approved(prescreen.session, _cap_key(first, prescreen, monkeypatch))
+    calls.clear()
+    _register_resolver(prescreen.session, "deny")                      # a person is asked again, and says no
+    result = A.check_execute_code_guard(second, "local")
+    assert result["approved"] is False and len(calls) == 1

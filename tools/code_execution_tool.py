@@ -766,16 +766,59 @@ def execute_code(
                 "it could complete (SIGTERM propagates to child processes). "
                 "Run the lifecycle command from a shell outside the gateway."
             )
-    from tools.terminal_tool import _get_env_config, _docker_has_host_access
+    from tools.terminal_tool import _get_env_config
     _env_config = _get_env_config()
     env_type = _env_config["env_type"]
+    from tools.approval import code_prescreen_serialises_cells
+    if not code_prescreen_serialises_cells():
+        return _guard_and_run(code, task_id, enabled_tools, bool(reset), env_type, _env_config, None)
+    # The static pre-screen judges this cell against what the cells before it left in the kernel's namespace, so
+    # scanning, approving and running it is one critical section per kernel (a second cell scanned meanwhile could run
+    # first, in a namespace this cell's scan never saw).
+    from tools.interrupt import is_interrupted as _is_interrupted
+    from tools.code_kernel import CellSectionInterrupted, kernel_cell_section
+    plan = _kernel_plan(env_type, task_id, enabled_tools)
+    try:
+        with kernel_cell_section(plan["key"], is_interrupted=_is_interrupted):
+            return _guard_and_run(code, task_id, enabled_tools, bool(reset), env_type, _env_config, plan)
+    except CellSectionInterrupted:
+        return tool_error("execute_code was interrupted while waiting for the previous cell of this session to finish.")
+
+
+def _kernel_plan(env_type: str, task_id: Optional[str], enabled_tools: Optional[list[str]]) -> dict[str, Any]:
+    """Which kernel this cell will run in, resolved once so the pre-screen's state lookup, the critical section and the
+    run itself all use the same key: ``{"key", "cell"}`` where ``cell`` is the local kernel's
+    ``(mode, python, cwd, tools)`` (None for a remote backend)."""
+    tools = frozenset(_sandbox_tools_for(enabled_tools))
+    if env_type != "local":
+        from tools.code_kernel_remote import remote_kernel_key
+        return {"key": remote_kernel_key(env_type, task_id or "default", tools), "cell": None}
+    from tools.code_kernel import session_kernel_key
+    mode = _get_execution_mode()
+    cell = (mode, _resolve_child_python(mode), _resolve_child_cwd(mode, "", task_id=task_id or ""), tools)
+    return {"key": session_kernel_key(task_id or "", *cell), "cell": cell}
+
+
+def _guard_and_run(code: str, task_id: Optional[str], enabled_tools: Optional[list[str]], reset: bool,
+                   env_type: str, env_config: dict[str, Any], plan: Optional[dict[str, Any]]) -> str:
+    """Approval guard, then the dispatch (local session kernel / remote backend). ``plan`` is set when the pre-screen
+    reads kernel state (see :func:`_kernel_plan`)."""
+    from tools.terminal_tool import _docker_has_host_access
     # Arbitrary Python never passes through terminal()/DANGEROUS_PATTERNS, so guard the whole
     # script before either dispatch path spawns it — in this (tool-executor) thread, which holds
     # the session context. A Docker sandbox with host bind mounts gets no container fast-path.
     # See #30882.
     from tools.approval import check_execute_code_guard
-    _guard = check_execute_code_guard(code, env_type, has_host_access=_docker_has_host_access(_env_config),
-                                      task_id=task_id or "")
+    guard_kwargs: dict[str, Any] = {}
+    if plan is not None:
+        if plan["cell"] is not None:
+            from tools.code_kernel import kernel_scan_state
+            guard_kwargs["kernel_state"] = kernel_scan_state(plan["key"], reset=reset)
+        else:
+            from tools.code_kernel_remote import remote_kernel_scan_state
+            guard_kwargs["kernel_state"] = remote_kernel_scan_state(plan["key"], reset=reset)
+    _guard = check_execute_code_guard(code, env_type, has_host_access=_docker_has_host_access(env_config),
+                                      task_id=task_id or "", **guard_kwargs)
     if not _guard.get("approved", False):
         return _error_result(_guard.get("message") or "execute_code blocked by approval guard.",
                              user_summary=_guard.get("user_summary"))
@@ -786,20 +829,23 @@ def execute_code(
         clear_current_thread_interrupt()
     from hermes_cli.observability.shared_metrics_loop import record_execution_backend
     if env_type != "local":
-        return record_execution_backend("code", "remote", _execute_remote(code, task_id, enabled_tools, reset=bool(reset)))
+        return record_execution_backend("code", "remote", _execute_remote(code, task_id, enabled_tools, reset=reset))
     from tools.interrupt import is_interrupted as _is_interrupted
     # Session kernels are always on locally (one interpreter per conversation); the guards above
     # already ran for this cell, and the kernel path shares env builder, RPC server and redaction.
     from tools.code_kernel import execute_in_session_kernel
     _cfg = _load_config()
-    _mode = _get_execution_mode()
+    if plan is not None and plan["cell"] is not None:
+        _mode, _python, _cwd, _tools = plan["cell"]
+    else:
+        _mode = _get_execution_mode()
+        _python, _cwd = _resolve_child_python(_mode), _resolve_child_cwd(_mode, "", task_id=task_id or "")
+        _tools = frozenset(_sandbox_tools_for(enabled_tools))
     return record_execution_backend("code", "local", execute_in_session_kernel(
-        code, task_id=task_id or "", mode=_mode, child_python=_resolve_child_python(_mode),
-        child_cwd=_resolve_child_cwd(_mode, "", task_id=task_id or ""),
-        sandbox_tools=frozenset(_sandbox_tools_for(enabled_tools)),
+        code, task_id=task_id or "", mode=_mode, child_python=_python, child_cwd=_cwd, sandbox_tools=_tools,
         timeout=_cfg.get("timeout", DEFAULT_TIMEOUT),
         max_tool_calls=_cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS),
-        reset=bool(reset), is_interrupted=_is_interrupted,
+        reset=reset, is_interrupted=_is_interrupted, cell_scan=_guard.get("code_scan"),
     ))
 
 

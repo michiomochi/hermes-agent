@@ -18,6 +18,7 @@ Also hosts what ``tools.code_kernel_remote`` shares: owner resolution, registry,
 from __future__ import annotations
 
 import atexit
+import contextlib
 import glob
 import json
 import logging
@@ -33,9 +34,15 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+
+from tools.approval_code_scan import CodeScan, KernelScanState
 
 logger = logging.getLogger(__name__)
+
+# A kernel's staging dir (and its child's cwd in strict mode) is ``mkdtemp(prefix=STAGING_DIR_PREFIX)`` inside the temp
+# dir. The approval pre-screen resolves relative paths from the same place (``approval._code_scan_cwd``).
+STAGING_DIR_PREFIX = "hermes_kernel_"
 
 _IS_WINDOWS = sys.platform == "win32"
 
@@ -291,6 +298,9 @@ class SessionKernel:
         self.raw, self.stderr = _BoundedBuffer(), _BoundedBuffer()
         self.execution_count, self.last_used = 0, time.monotonic()
         self.cell_authority: Optional[CellAuthority] = None
+        # What the cells that ran here left in the shared namespace, for the approval pre-screen. It belongs to this
+        # process: a replaced or killed kernel is a new SessionKernel and starts clean.
+        self.scan_state = KernelScanState()
 
     def alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
@@ -574,7 +584,7 @@ def _spawn(kernel: SessionKernel, *, child_python: str, child_cwd: str,
            sandbox_tools: frozenset, max_tool_calls: int, task_id: str = "") -> None:
     from tools.code_execution_env import _build_child_env
     from tools.code_execution_tool import generate_hermes_tools_module
-    kernel.tmpdir = tempfile.mkdtemp(prefix="hermes_kernel_")
+    kernel.tmpdir = tempfile.mkdtemp(prefix=STAGING_DIR_PREFIX)
     kernel.rpc_token = secrets.token_urlsafe(32)
     kernel.sentinel = "@@HERMES-KERNEL-" + secrets.token_urlsafe(16) + "@@"
     rpc_endpoint = _bind_rpc_socket(kernel)
@@ -670,7 +680,7 @@ def _sweep_stale_staging_dirs(now: Optional[float] = None) -> int:
     follows symlinks, so a planted link is rejected rather than chased."""
     now = time.time() if now is None else now
     removed = 0
-    for path in glob.glob(os.path.join(tempfile.gettempdir(), "hermes_kernel_*")):
+    for path in glob.glob(os.path.join(tempfile.gettempdir(), STAGING_DIR_PREFIX + "*")):
         try:
             if now - os.path.getmtime(path) > _STALE_STAGING_DIR_AGE:
                 # No ignore_errors: a rejected symlink (or a half-removed dir) must not
@@ -804,20 +814,75 @@ def _cell_result(kernel: SessionKernel, key: tuple, status: str, payload: dict[s
     return result
 
 
+def session_kernel_key(task_id: str, mode: str, child_python: str, child_cwd: str, sandbox_tools: frozenset) -> tuple:
+    """Registry key of the (owner, mode, python, cwd, tools) session kernel a cell runs in."""
+    return (_resolve_owner(task_id) or "", mode, child_python, child_cwd, tuple(sorted(sandbox_tools)))
+
+
+def kernel_scan_state(key: tuple, *, reset: bool = False) -> KernelScanState:
+    """What the live kernel under *key* has had run in it (a clean state when there is none, or ``reset`` will
+    replace it): the input of the approval pre-screen for the next cell."""
+    if reset:
+        return KernelScanState()
+    with _REGISTRY.lock:
+        kernel = _KERNELS.get(key)
+    return KernelScanState() if kernel is None or kernel.dead() else kernel.scan_state
+
+
+class CellSectionInterrupted(Exception):
+    """The turn was interrupted while a cell waited for the kernel's previous cell to finish."""
+
+
+_SECTIONS: dict[tuple, list] = {}          # key -> [RLock, users]; an entry lives only while someone holds / waits
+_SECTIONS_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def kernel_cell_section(key: tuple, *, is_interrupted: Optional[Callable[[], bool]] = None) -> Iterator[None]:
+    """Critical section for ONE cell of the kernel under *key*: pre-screen scan, approval and run.
+
+    The pre-screen judges a cell against the namespace earlier cells left. If a second cell could be scanned while the
+    first waits for its approval and then run before it, the first would run in a namespace its scan never saw. The
+    wait honours ``is_interrupted`` (raises :class:`CellSectionInterrupted`); other kernels never wait for this one.
+    """
+    with _SECTIONS_LOCK:
+        entry = _SECTIONS.setdefault(key, [threading.RLock(), 0])
+        entry[1] += 1
+    lock = entry[0]
+    try:
+        while not lock.acquire(timeout=0.25):
+            if is_interrupted is not None and is_interrupted():
+                raise CellSectionInterrupted()
+        try:
+            yield
+        finally:
+            lock.release()
+    finally:
+        with _SECTIONS_LOCK:
+            entry[1] -= 1
+            if entry[1] == 0 and _SECTIONS.get(key) is entry:
+                del _SECTIONS[key]
+
+
 def execute_in_session_kernel(
     code: str, *, task_id: str, mode: str, child_python: str, child_cwd: str,
     sandbox_tools: frozenset, timeout: int, max_tool_calls: int, reset: bool, is_interrupted,
+    cell_scan: Optional[CodeScan] = None,
 ) -> str:
     """Run one cell in the (owner, mode, python, cwd, tools) session kernel. The owner is the
-    session key (``_resolve_owner``), not the per-turn task id, so state survives across turns."""
-    key = (_resolve_owner(task_id) or "", mode, child_python, child_cwd, tuple(sorted(sandbox_tools)))
+    session key (``_resolve_owner``), not the per-turn task id, so state survives across turns.
+
+    ``cell_scan`` is the approval pre-screen's scan of *code*; it is added to the kernel's scan state before the cell
+    runs. None (never scanned: approvals off / yolo / pre-screen off) marks the kernel as holding an unvouched cell."""
+    key = session_kernel_key(task_id, mode, child_python, child_cwd, sandbox_tools)
     exec_start = time.monotonic()
     from agent.delegation_context import is_delegated_child_context
     kernel, state_reset = _acquire_kernel(key, reset, pinned=is_delegated_child_context())
     try:
         return _run_cell(kernel, key, code, task_id=task_id, child_python=child_python, child_cwd=child_cwd,
                          sandbox_tools=sandbox_tools, timeout=timeout, max_tool_calls=max_tool_calls,
-                         is_interrupted=is_interrupted, exec_start=exec_start, state_reset=state_reset)
+                         is_interrupted=is_interrupted, exec_start=exec_start, state_reset=state_reset,
+                         cell_scan=cell_scan)
     finally:
         with _REGISTRY.lock:
             kernel.attached -= 1
@@ -831,7 +896,7 @@ def execute_in_session_kernel(
 
 def _run_cell(kernel: SessionKernel, key: tuple, code: str, *, task_id: str, child_python: str,
               child_cwd: str, sandbox_tools: frozenset, timeout: int, max_tool_calls: int,
-              is_interrupted, exec_start: float, state_reset: bool) -> str:
+              is_interrupted, exec_start: float, state_reset: bool, cell_scan: Optional[CodeScan] = None) -> str:
     reused = kernel.proc is not None
     # Captured on the calling thread BEFORE the cell runs (the snapshot a per-call RPC thread
     # would get) and installed on the kernel so RPC dispatches under THIS cell's identity.
@@ -847,6 +912,8 @@ def _run_cell(kernel: SessionKernel, key: tuple, code: str, *, task_id: str, chi
             kernel.cell_log_start = len(kernel.tool_call_log)
             kernel.raw.drain(), kernel.stderr.drain()  # raw output leaked between cells belongs to no cell
             kernel.cell_authority = authority
+            # Recorded BEFORE the cell runs (and whatever its outcome): a half-run cell has left its names behind too.
+            kernel.scan_state = kernel.scan_state.after(cell_scan)
             kernel.proc.stdin.write((json.dumps({"id": uuid.uuid4().hex, "code": code}) + "\n").encode("utf-8"))
             kernel.proc.stdin.flush()
             status, payload = _await_cell(kernel, timeout, is_interrupted)

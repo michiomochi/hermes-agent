@@ -18,6 +18,13 @@ The scan can only ever *grant* a one-shot approval (SAFE) or *raise* the severit
 lowers a guardian DENY/ESCALATE and is not a security boundary (SECURITY.md §2.2) — it is a cheap,
 deterministic filter in front of the LLM. Any internal failure degrades to ``review``.
 
+The allow-list reasons about a program as if it ran in a *fresh* interpreter (``str`` is the string type, ``open`` is
+the builtin, the cwd is where the child started). A session kernel runs every cell in ONE namespace, so
+:func:`scan_python` also takes what earlier cells left behind (``prior_bindings`` / ``prior_chdir``;
+:class:`KernelScanState` accumulates them) and reports the names the cell itself leaves
+(``CodeScan.top_level_bindings``). Only a cell that reads none of the prior names, in a kernel where nothing
+unvetted ran, can be SAFE.
+
 ``features`` describe what the program can do (``net:none``, ``write:roots``, ``proc:gated`` …);
 :func:`capability_key` folds them into an approval key so a "session" grant covers a capability
 class instead of every script.
@@ -52,6 +59,30 @@ class CodeScan:
     tier: Tier
     features: frozenset[str]
     reasons: tuple[str, ...]
+    # Names the program leaves in the module namespace (imports, defs, assignments at any nesting, ``global`` in a
+    # function ...). Empty when the program could not be analysed; the kernel state then treats the cell as unvouched
+    # (see :meth:`KernelScanState.after`: it is not SAFE).
+    top_level_bindings: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True)
+class KernelScanState:
+    """What the cells that already ran in one session kernel may have left behind.
+
+    ``bindings`` are the names they bound in the shared namespace. ``chdir_possible`` is set once ANY earlier cell was
+    not SAFE (or was never scanned): such a cell may have called ``os.chdir``, patched a module, or bound names
+    through ``exec`` / ``globals()``, none of which the bindings capture, so from then on nothing in that kernel is
+    SAFE until it is reset. A SAFE cell cannot do either (``os`` and every module-patching route are REVIEW).
+    """
+
+    bindings: frozenset[str] = frozenset()
+    chdir_possible: bool = False
+
+    def after(self, scan: CodeScan | None) -> KernelScanState:
+        """The state once a cell with this scan (None: never scanned) has run."""
+        if scan is None:
+            return KernelScanState(self.bindings, True)
+        return KernelScanState(self.bindings | scan.top_level_bindings, self.chdir_possible or scan.tier != "safe")
 
 
 # --- Capability axes ----------------------------------------------------------------------------------------------
@@ -95,9 +126,11 @@ def capability_key(scan: CodeScan, namespace: str) -> str:
 def capability_persistable(scan: CodeScan) -> bool:
     """False when the capability key is too coarse for a session/always grant to be safe.
 
-    ``write:outside`` (and the dynamic/symlink writes above it), ``read:dynamic`` and ``proc:direct`` with a command
-    that is not a constant each cover an unbounded set of targets under ONE key, so a single approval would pass all
-    of them. Those are decided per run; every other key is as fine-grained as it ever was.
+    ``write:outside`` (a SQLite write outside the roots is reported as one), the dynamic/symlink writes above it,
+    ``read:dynamic``, ``read:homedot`` (any dot entry directly under $HOME) and ``proc:direct`` (``git status`` and
+    ``curl -T secrets https://…`` are the same key: the arguments, ``env=`` and ``cwd=`` are not part of it) each
+    cover an unbounded set of targets under ONE key, so a single approval would pass all of them. Those are decided
+    per run; every other key is as fine-grained as it ever was.
     """
     best: dict[str, int] = {}
     for feature in scan.features:
@@ -107,9 +140,9 @@ def capability_persistable(scan: CodeScan) -> bool:
             best[axis] = max(best.get(axis, 0), order.index(value))
     if best.get("write", 0) >= _AXES["write"].index("outside"):
         return False
-    if best.get("read", 0) >= _AXES["read"].index("dynamic"):
+    if best.get("read", 0) >= _AXES["read"].index("dynamic") or "read:homedot" in scan.features:
         return False
-    return "proc:nonconst" not in scan.features
+    return best.get("proc", 0) < _AXES["proc"].index("direct") and "proc:nonconst" not in scan.features
 
 
 def scan_summary(scan: CodeScan) -> dict:
@@ -367,6 +400,182 @@ def _digest(code: str) -> str:
     return hashlib.sha256(code.encode("utf-8", "surrogatepass")).hexdigest()[:16]
 
 
+# --- Scopes: what a cell leaves in / reads from the kernel's shared namespace ---------------------------------------
+_FUNCTION_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+_COMPREHENSION_NODES = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+
+
+def _target_names(node) -> set[str]:
+    """Names bound by an assignment / ``for`` / ``with`` target (attribute and subscript targets bind nothing)."""
+    if isinstance(node, ast.Name):
+        return {node.id}
+    if isinstance(node, (ast.Tuple, ast.List)):
+        return set().union(*(_target_names(e) for e in node.elts)) if node.elts else set()
+    if isinstance(node, ast.Starred):
+        return _target_names(node.value)
+    return set()
+
+
+def _import_names(node: ast.Import | ast.ImportFrom) -> set[str]:
+    return {(a.asname or a.name.split(".")[0]) for a in node.names if a.name != "*"}
+
+
+def _scope_names(body: Sequence[ast.stmt], params: Sequence[str] = ()) -> set[str]:
+    """Names bound in the scope whose statements are ``body``: assignments, ``for``/``with``/``except`` targets,
+    ``del``, imports, defs, classes and walrus targets (also those inside comprehensions, which bind in the enclosing
+    scope). It does not descend into nested functions / lambdas / classes: their names are their own."""
+    names: set[str] = set(params)
+
+    def walk(node, in_comprehension: bool = False) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(child.name)
+                continue
+            if isinstance(child, ast.Lambda):
+                continue
+            if isinstance(child, ast.Name) and isinstance(child.ctx, (ast.Store, ast.Del)):
+                # A comprehension's own loop variables are local to it; only its walrus targets leak.
+                if not in_comprehension or isinstance(node, ast.NamedExpr):
+                    names.add(child.id)
+            elif isinstance(child, (ast.Import, ast.ImportFrom)):
+                names.update(_import_names(child))
+            elif isinstance(child, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and child.name:
+                names.add(child.name)
+            elif isinstance(child, ast.MatchMapping) and child.rest:
+                names.add(child.rest)
+            walk(child, in_comprehension or isinstance(child, _COMPREHENSION_NODES))
+
+    for stmt in body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(stmt.name)
+            continue
+        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+            names.update(_import_names(stmt))
+        walk(ast.Module(body=[stmt], type_ignores=[]))
+    return names
+
+
+def _declared(body_owner, kinds) -> set[str]:
+    return {n for sub in ast.walk(body_owner) if isinstance(sub, kinds) for n in sub.names}
+
+
+def _function_locals(fn) -> set[str]:
+    a = fn.args
+    params = [x.arg for x in (*a.posonlyargs, *a.args, *a.kwonlyargs)]
+    params += [x.arg for x in (a.vararg, a.kwarg) if x is not None]
+    if isinstance(fn, ast.Lambda):
+        return _scope_names([ast.Expr(value=fn.body)], params)
+    return (_scope_names(fn.body, params) - _declared(fn, ast.Global)) | _declared(fn, ast.Nonlocal)
+
+
+def _global_reads(node, shadow: frozenset, out: set) -> None:
+    """Add to ``out`` the names ``node`` reads from the MODULE namespace: loads that no enclosing function /
+    comprehension scope shadows, including the ones inside function bodies (they run later, at some call)."""
+    if isinstance(node, ast.Name):
+        if isinstance(node.ctx, ast.Load) and node.id not in shadow:
+            out.add(node.id)
+        return
+    if isinstance(node, ast.AugAssign):
+        if isinstance(node.target, ast.Name) and node.target.id not in shadow:
+            out.add(node.target.id)
+        else:
+            _global_reads(node.target, shadow, out)
+        _global_reads(node.value, shadow, out)
+        return
+    if isinstance(node, _FUNCTION_NODES):
+        pre, body = _function_reads(node, shadow)
+        out |= pre | body
+        return
+    if isinstance(node, _COMPREHENSION_NODES):
+        inner = shadow | set().union(*(_target_names(g.target) for g in node.generators))
+        for i, gen in enumerate(node.generators):
+            _global_reads(gen.iter, shadow if i == 0 else inner, out)   # the first iterable is the enclosing scope's
+            for cond in gen.ifs:
+                _global_reads(cond, inner, out)
+        for part in ((node.key, node.value) if isinstance(node, ast.DictComp) else (node.elt,)):
+            _global_reads(part, inner, out)
+        return
+    for child in ast.iter_child_nodes(node):
+        _global_reads(child, shadow, out)
+
+
+def _function_reads(fn, shadow: frozenset) -> tuple[set, set]:
+    """``(read when the def statement runs, read when the body runs)`` for a function or lambda."""
+    pre: set = set()
+    a = fn.args
+    for part in (*a.defaults, *(d for d in a.kw_defaults if d is not None), *getattr(fn, "decorator_list", ())):
+        _global_reads(part, shadow, pre)
+    for arg in (*a.posonlyargs, *a.args, *a.kwonlyargs, a.vararg, a.kwarg):
+        if arg is not None and arg.annotation is not None:
+            _global_reads(arg.annotation, shadow, pre)
+    if getattr(fn, "returns", None) is not None:
+        _global_reads(fn.returns, shadow, pre)
+    body: set = set()
+    inner = shadow | _function_locals(fn)
+    for stmt in (fn.body if isinstance(fn.body, list) else [fn.body]):
+        _global_reads(stmt, inner, body)
+    return pre, body
+
+
+def _module_bindings(tree: ast.Module) -> frozenset:
+    """Every name the program can leave in the module namespace, ``global`` declarations in functions included."""
+    return frozenset(_scope_names(tree.body) | _declared(tree, ast.Global))
+
+
+def _prior_conflicts(tree: ast.Module, prior: frozenset) -> list:
+    """Names in ``prior`` that the program may read BEFORE it has certainly rebound them, in order.
+
+    Walks the top-level statements in execution order. A name is *cleared* once a top-level statement that always runs
+    has bound it (import, def, class, plain assignment, ``for`` / ``with`` target); reads after that point see the
+    program's own value. Everything else — a read earlier in the cell, inside a function defined earlier, a binding
+    under ``if`` / ``try`` / ``while`` — may see what an earlier cell left there.
+    """
+    cleared: set[str] = set()
+    bad: list[str] = []
+
+    def check(names: set) -> None:
+        for name in sorted(names):
+            if name in prior and name not in cleared and name not in bad:
+                bad.append(name)
+
+    for stmt in tree.body:
+        pre: set = set()
+        post: set = set()
+        binds: set = set()
+        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+            binds = _import_names(stmt)
+        elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            pre, post = _function_reads(stmt, frozenset())
+            binds = {stmt.name}
+        elif isinstance(stmt, ast.ClassDef):
+            _global_reads(stmt, frozenset(), pre)
+            binds = {stmt.name}
+        elif isinstance(stmt, ast.Assign):
+            _global_reads(stmt, frozenset(), pre)
+            binds = set().union(*(_target_names(t) for t in stmt.targets))
+        elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+            _global_reads(stmt, frozenset(), pre)
+            binds = _target_names(stmt.target)
+        elif isinstance(stmt, ast.For):
+            for part in (stmt.iter, stmt.target, *stmt.orelse):        # ``else`` also runs when nothing was bound
+                _global_reads(part, frozenset(), pre)
+            for part in stmt.body:
+                _global_reads(part, frozenset(), post)
+            binds = _target_names(stmt.target)
+        elif isinstance(stmt, ast.With):
+            for item in stmt.items:
+                _global_reads(item.context_expr, frozenset(), pre)
+                binds |= _target_names(item.optional_vars) if item.optional_vars is not None else set()
+            for part in stmt.body:
+                _global_reads(part, frozenset(), post)
+        else:
+            _global_reads(stmt, frozenset(), pre)
+        check(pre)
+        cleared |= binds
+        check(post)
+    return bad
+
+
 class _TildePath(str):
     """A path starting with ``~``: ``alt`` is the literal (cwd-relative) reading of the same text."""
 
@@ -375,9 +584,11 @@ class _TildePath(str):
 
 class _Scanner(ast.NodeVisitor):
     def __init__(self, code: str, tree: ast.AST, *, write_roots: Sequence, cwd, deny_globs: Sequence[str],
-                 hermes_home) -> None:
+                 hermes_home, prior_bindings: frozenset = frozenset(), prior_chdir: bool = False) -> None:
         self.code = code
         self.tree = tree
+        self.prior_bindings = prior_bindings
+        self.prior_chdir = prior_chdir
         self.cwd = os.path.realpath(os.fspath(cwd)) if cwd else os.getcwd()
         self.roots = [
             r for r in (os.path.realpath(os.fspath(p)) for p in write_roots if p) if r not in ("/", "")
@@ -389,7 +600,12 @@ class _Scanner(ast.NodeVisitor):
             os.path.join(hermes, "config.yaml"), os.path.join(hermes, "hermes-agent", "**"),
         )
         self.home = home
-        # Reading these dot-directories under $HOME is routine for Hermes itself; any other dot entry is REVIEW.
+        # ``~/.hermes`` is deliberately NOT a ``read:homedot`` case: reading state.db, skills, sessions and logs is what
+        # Hermes's own scripts do all day, so those reads stay SAFE. That is safe to allow because (1) the credentials
+        # that live in it (.env, the auth file) are HIGH through _CRED_GLOBS whatever the directory, and (2) anything a
+        # script could CHANGE there is a write, which is never SAFE outside the write roots.
+        # Any OTHER dot entry directly under $HOME (~/.bashrc, ~/.config/x, ~/.gitconfig ...) is REVIEW
+        # (``read:homedot``) and its key is not persistable: one grant must not cover every dotfile.
         self.dot_exempt = [os.path.realpath(os.path.join(home, ".hermes")), os.path.realpath(hermes)]
         self.features: set[str] = set()
         self.review: list[str] = []
@@ -399,6 +615,11 @@ class _Scanner(ast.NodeVisitor):
         # Methods the program itself defines, per class (their bodies are scanned too). A call is only trusted when the
         # receiver is provably an instance of such a class, never merely because some class has a method of that name.
         self.class_methods: dict[str, set[str]] = {}
+        # Undecorated methods only: those are the ones whose first parameter the program treats as "an instance of this
+        # class" (see _is_local_method_call), which holds only while they are called bound, through an instance.
+        self.plain_methods: dict[str, set[str]] = {}
+        # Classes that define ``__new__``: ``Cls(...)`` may return any object, so it proves nothing about the receiver.
+        self.custom_new: set[str] = set()
         self.class_bases: dict[str, list[str]] = {}
         self.ambiguous: set[str] = set()
         self.bindings: dict[str, list[str]] = {}
@@ -441,6 +662,8 @@ class _Scanner(ast.NodeVisitor):
                 owner = getattr(node, _PARENT, None)
                 if isinstance(owner, ast.ClassDef) and node.name not in _EFFECT_ATTRS:
                     self.class_methods.setdefault(owner.name, set()).add(node.name)
+                    if not node.decorator_list:
+                        self.plain_methods.setdefault(owner.name, set()).add(node.name)
                 for a in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs):
                     bind(a.arg, "other")
                 for a in (node.args.vararg, node.args.kwarg):
@@ -450,6 +673,9 @@ class _Scanner(ast.NodeVisitor):
                 bind(node.name, "class")
                 self.class_methods.setdefault(node.name, set())
                 self.class_bases[node.name] = [b.id for b in node.bases if isinstance(b, ast.Name)]
+                if any((isinstance(n, ast.FunctionDef) and n.name == "__new__")
+                       or (isinstance(n, ast.Name) and n.id == "__new__") for n in ast.walk(node)):
+                    self.custom_new.add(node.name)
             elif isinstance(node, ast.Lambda):
                 for a in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs):
                     bind(a.arg, "other")
@@ -698,7 +924,9 @@ class _Scanner(ast.NodeVisitor):
                 self.features.add("read:fs")
             return
         if any(_fnmatch_any(p, self.self_modify_globs) for p in candidates):
-            self.hi(node, f"{kind}:outside", f"{what}: modifies Hermes's own config or source")
+            # The feature must sit on its capability axis ("del", not "delete") or the key would not collapse it.
+            self.hi(node, f"{'del' if kind == 'delete' else kind}:outside",
+                    f"{what}: modifies Hermes's own config or source")
             return
         in_roots = self._in_roots(real) and not self._has_git_component(path)
         if kind == "delete":
@@ -788,6 +1016,10 @@ class _Scanner(ast.NodeVisitor):
         if name in self.bindings:
             if name == "open":
                 self.rev(node, "alias:open", "open is rebound in the program")
+            elif self.bindings[name] == ["class"] and not self._class_use_ok(node):
+                # The class object itself, handed on: whoever receives it can call its plain methods UNBOUND with any
+                # object as ``self`` (``B = A; B.get(path, dst)``, ``f(A, ...)`` with ``c.get(...)`` inside).
+                self.rev(node, f"class:value:{name}", f"class {name} used as a value")
             return
         if name == "open":
             if not is_callee:
@@ -797,9 +1029,44 @@ class _Scanner(ast.NodeVisitor):
             return
         self.rev(node, f"name:unknown:{name}", f"unrecognised name {name}")
 
+    def _class_use_ok(self, node) -> bool:
+        """Uses of a name bound to the program's own class that cannot leak the class object: constructing it, deriving
+        from it, ``isinstance`` / ``issubclass`` / ``super``, ``except`` / ``raise``, annotations, attribute access
+        (vetted in visit_Attribute)."""
+        parent = getattr(node, _PARENT, None)
+        if isinstance(parent, ast.Call):
+            if parent.func is node:
+                return True
+            f = parent.func
+            return (isinstance(f, ast.Name) and f.id in ("isinstance", "issubclass", "super")
+                    and f.id not in self.bindings and node in parent.args)
+        if isinstance(parent, ast.ClassDef):
+            return node in parent.bases
+        if isinstance(parent, ast.Attribute):
+            return parent.value is node
+        if isinstance(parent, ast.ExceptHandler):
+            return parent.type is node
+        if isinstance(parent, ast.Raise):
+            return node in (parent.exc, parent.cause)
+        if isinstance(parent, ast.Tuple):                   # isinstance(x, (A, B)) / except (A, B)
+            return self._class_use_ok(parent)
+        child = node
+        while parent is not None:                           # inside an annotation
+            owner = getattr(parent, _PARENT, None)
+            if (isinstance(parent, ast.arg) and parent.annotation is child) \
+                    or (isinstance(parent, ast.AnnAssign) and parent.annotation is child) \
+                    or (isinstance(parent, ast.FunctionDef) and parent.returns is child):
+                return True
+            child, parent = parent, owner
+        return False
+
     def visit_Attribute(self, node: ast.Attribute):
         attr = node.attr
         parent = getattr(node, _PARENT, None)
+        if (isinstance(node.value, ast.Name) and isinstance(node.ctx, ast.Load)
+                and self.bindings.get(node.value.id) == ["class"] and self._class_has_plain_method(node.value.id, attr)):
+            self.rev(node, f"call:unbound:{attr}",
+                     f"{node.value.id}.{attr}: a plain method reached through its class, so its self can be any object")
         if not attr.isascii():
             self.rev(node, "ident:non-ascii", f"non-ASCII attribute {attr!r}")
         if attr.startswith("__") and attr.endswith("__"):
@@ -971,12 +1238,28 @@ class _Scanner(ast.NodeVisitor):
             return True
         return any(self._class_has_method(b, method, _seen | {cls}) for b in self.class_bases.get(cls, ()))
 
+    def _class_lineage(self, cls: str, _seen: frozenset = frozenset()) -> list[str]:
+        """``cls`` and the program's own classes it inherits from."""
+        if cls in _seen or self.bindings.get(cls) != ["class"]:
+            return []
+        out = [cls]
+        for base in self.class_bases.get(cls, ()):
+            out += self._class_lineage(base, _seen | {cls})
+        return out
+
+    def _class_has_plain_method(self, cls: str, method: str) -> bool:
+        return any(method in self.plain_methods.get(c, ()) for c in self._class_lineage(cls))
+
+    def _class_defines_new(self, cls: str) -> bool:
+        return any(c in self.custom_new for c in self._class_lineage(cls))
+
     def _instance_class(self, node) -> str | None:
-        """Name of the program's own class when ``node`` is ``Cls(...)`` or a top-level ``x = Cls(...)`` variable."""
+        """Name of the program's own class when ``node`` is ``Cls(...)`` or a top-level ``x = Cls(...)`` variable.
+        A class with its own ``__new__`` is no proof: the call may hand back any object (a Path, a connection)."""
         if isinstance(node, ast.Name) and self.bindings.get(node.id) == ["assign-top"]:
             node = self.const_values.get(node.id)
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and self.bindings.get(node.func.id) == ["class"]:
-            return node.func.id
+            return None if self._class_defines_new(node.func.id) else node.func.id
         return None
 
     def _is_local_method_call(self, func: ast.Attribute) -> bool:
@@ -991,10 +1274,18 @@ class _Scanner(ast.NodeVisitor):
             fn = getattr(func, _PARENT, None)
             while fn is not None and not isinstance(fn, (ast.FunctionDef, ast.Lambda, ast.Module)):
                 fn = getattr(fn, _PARENT, None)
-            if not isinstance(fn, ast.FunctionDef) or not fn.args.args or fn.args.args[0].arg != receiver.id:
+            if not isinstance(fn, ast.FunctionDef):
+                return False
+            positional = [*fn.args.posonlyargs, *fn.args.args]
+            if not positional or positional[0].arg != receiver.id:
                 return False
             owner = getattr(fn, _PARENT, None)
             if not isinstance(owner, ast.ClassDef):
+                return False
+            # ``self`` is "an instance of this class" only for an undecorated method of a class whose constructor is
+            # the ordinary one: a staticmethod's first parameter is just an argument, and a class with ``__new__``
+            # may return something else entirely.
+            if fn.decorator_list or self._class_defines_new(owner.name):
                 return False
             rebound = any(
                 isinstance(n, ast.Name) and n.id == receiver.id and isinstance(n.ctx, (ast.Store, ast.Del))
@@ -1240,6 +1531,14 @@ class _Scanner(ast.NodeVisitor):
 
     # -- finish ------------------------------------------------------------------------------------------------
     def finish(self) -> None:
+        # State left by earlier cells of the same kernel (see KernelScanState): the checks above assume a fresh
+        # interpreter, so a name an earlier cell bound is not the builtin / constant / import this program means.
+        if self.prior_chdir:
+            self.rev(self.tree, "state:chdir",
+                     "an earlier cell of this kernel may have changed the working directory or patched the interpreter")
+        tree = self.tree if isinstance(self.tree, ast.Module) else ast.Module(body=[], type_ignores=[])
+        for name in _prior_conflicts(tree, self.prior_bindings) if self.prior_bindings else ():
+            self.rev(self.tree, f"state:prior:{name}", f"{name} may have been rebound by an earlier cell of this kernel")
         if self.saw_decode and self.saw_exec:
             self.hi(self.tree, "obf:dynamic", "decoded data and dynamic execution in the same program")
         if self.db_write_lines:
@@ -1249,7 +1548,9 @@ class _Scanner(ast.NodeVisitor):
                 for path, read_only, memory, _ in self.connects
             )
             if not ok:
-                self.features.add("db:write")
+                # ``write:outside`` too, not just ``db:write``: the key must say "outside the roots" even when the
+                # program also writes files inside them, and it is what makes the capability non-persistable.
+                self.features.update({"db:write", "write:outside"})
                 self.review.append(f"SQLite write whose database is not inside the write roots at line {line}")
             else:
                 self.features.add("write:roots")
@@ -1260,8 +1561,11 @@ class _Scanner(ast.NodeVisitor):
 
 
 def scan_python(code: str, *, write_roots: Sequence, cwd, deny_globs: Sequence[str] = (),
-                hermes_home=None) -> CodeScan:
-    """Classify ``code`` as SAFE / REVIEW / HIGH. Never raises; any internal failure is REVIEW."""
+                hermes_home=None, prior_bindings: frozenset = frozenset(), prior_chdir: bool = False) -> CodeScan:
+    """Classify ``code`` as SAFE / REVIEW / HIGH. Never raises; any internal failure is REVIEW.
+
+    ``prior_bindings`` / ``prior_chdir`` describe the kernel the program will run in (a :class:`KernelScanState`);
+    leave them at their defaults only for a fresh interpreter, where the program is the first thing that runs."""
     digest = _digest(code)
     opaque = frozenset({f"opaque:{digest}"})
     n_bytes = len(code.encode("utf-8", "surrogatepass"))
@@ -1273,10 +1577,12 @@ def scan_python(code: str, *, write_roots: Sequence, cwd, deny_globs: Sequence[s
         return CodeScan("review", opaque | {"syntax:error"}, (f"cannot parse with this interpreter: {type(exc).__name__}",))
     try:
         scanner = _Scanner(code, tree, write_roots=write_roots, cwd=cwd, deny_globs=deny_globs,
-                           hermes_home=hermes_home)
+                           hermes_home=hermes_home, prior_bindings=frozenset(prior_bindings or ()),
+                           prior_chdir=bool(prior_chdir))
         scanner.prepare()
         scanner.visit(tree)
         scanner.finish()
+        bindings = _module_bindings(tree)
     except Exception as exc:  # RecursionError on pathological nesting included
         logger.debug("code scan failed: %s: %s", type(exc).__name__, exc)
         return CodeScan("review", opaque | {"scan:error"}, (f"scan failed: {type(exc).__name__}",))
@@ -1294,4 +1600,4 @@ def scan_python(code: str, *, write_roots: Sequence, cwd, deny_globs: Sequence[s
         tier = "safe"
     if tier != "safe" and too_big:
         features.add(f"opaque:{digest}")
-    return CodeScan(tier, frozenset(features), tuple(reasons[:_MAX_REASONS]))
+    return CodeScan(tier, frozenset(features), tuple(reasons[:_MAX_REASONS]), bindings)
