@@ -14,7 +14,7 @@ import os
 
 import pytest
 
-from tools.approval_code_scan import CodeScan, capability_key, scan_python
+from tools.approval_code_scan import CodeScan, capability_key, capability_persistable, scan_python
 
 ROOT = "@S@"
 
@@ -88,6 +88,23 @@ SAFE = {
     "hermes-file-tools-literal": (
         "from hermes_tools import read_file, write_file\nprint(read_file('@H@/a.txt'))\nwrite_file('@S@/b.txt', 'x')"
     ),
+    "str-replace-two-args": "print('abc'.replace('a', 'b'))",
+    "datetime-replace-keywords": "import datetime\nprint(datetime.datetime.now().replace(hour=0, minute=0))",
+    "list-copy": "xs = [1, 2]\nprint(xs.copy())",
+    "copy-within-roots": "from pathlib import Path\nPath('@H@/notes/a.md').copy('@S@/b.md')",
+    "pragma-table-info": (
+        "import sqlite3\nc = sqlite3.connect('@H@/.hermes/state.db')\n"
+        "print(c.execute('PRAGMA table_info(sessions)').fetchall())"
+    ),
+    "pragma-user-version-bare": (
+        "import sqlite3\nc = sqlite3.connect('@H@/.hermes/state.db')\nprint(c.execute('PRAGMA user_version').fetchone())"
+    ),
+    "self-method-call": (
+        "class A:\n    def f(self):\n        return 1\n    def g(self):\n        return self.f()\nprint(A().g())"
+    ),
+    "local-instance-method": "class A:\n    def f(self):\n        return 1\na = A()\nprint(a.f())",
+    "inherited-local-method": "class A:\n    def f(self):\n        return 1\nclass B(A):\n    pass\nprint(B().f())",
+    "git-lookalike-name-in-roots": "from pathlib import Path\nPath('@S@/.gitignore').write_text('x')",
     "env-single-benign-key": "import os\nprint(os.environ['HOME'])",  # `os` itself is REVIEW (see below); kept here to document
 }
 SAFE.pop("env-single-benign-key")
@@ -334,3 +351,184 @@ def test_review_grant_for_one_unrecognised_name_does_not_cover_another(env):
     a = capability_key(env.scan("foo()"), "execute_code")
     b = capability_key(env.scan("bar()"), "execute_code")
     assert a != b
+
+
+# --- review round 2: one reproduction per hole ------------------------------------------------------------------
+# Each test names an input that an earlier revision rated SAFE although it changes something outside the write roots.
+
+def _scan_with_roots(env, code, roots, cwd=None):
+    code = code.replace("@S@", str(env.scratch)).replace("@H@", str(env.home)).replace("@W@", str(env.work))
+    return scan_python(code, write_roots=roots, cwd=cwd or env.work, deny_globs=[], hermes_home=env.hermes)
+
+
+@pytest.mark.parametrize("code, tier", [
+    ("from pathlib import Path\nPath('~/.hermes/config.yaml').rename(target='@S@/x')", "high"),
+    ("from pathlib import Path\nPath('@S@/a').rename(target='@H@/b')", "review"),
+    ("from pathlib import Path\nPath('@S@/a').replace(target='@H@/b')", "review"),
+    ("from pathlib import Path\nPath('@S@/a').rename('@H@/b')", "review"),
+    ("from pathlib import Path\nd = {}\nPath('@S@/a').rename(**d)", "review"),
+])
+def test_blocker1_path_rename_and_replace_with_keyword_target_is_a_move(env, code, tier):
+    scan = env.scan(code)
+    assert scan.tier == tier, (scan.tier, scan.reasons, sorted(scan.features))
+
+
+@pytest.mark.parametrize("sql", [
+    "PRAGMA schema_version(1)", "PRAGMA journal_mode(OFF)", "PRAGMA user_version(5)", "PRAGMA wal_checkpoint",
+    "PRAGMA optimize", "PRAGMA main.schema_version(1)",
+])
+def test_blocker2_pragma_with_argument_or_side_effect_is_a_db_write(env, sql):
+    scan = env.scan(f"import sqlite3\nc = sqlite3.connect('@H@/.hermes/state.db')\nc.execute({sql!r})")
+    assert scan.tier == "review" and "db:write" in scan.features, (scan.reasons, sorted(scan.features))
+
+
+@pytest.mark.parametrize("target", [
+    "file:@S@/%2E%2E/x.db", "file:@S@/%2e%2e/%2e%2e/x.db", "file://localhost@S@/%2E%2E/x.db",
+])
+def test_blocker3_percent_encoded_dotdot_in_a_sqlite_uri_leaves_the_roots(env, target):
+    scan = env.scan(f"import sqlite3\nc = sqlite3.connect({target!r}, uri=True)\nc.execute('CREATE TABLE t(x)')")
+    assert scan.tier == "review" and "db:write" in scan.features, (scan.reasons, sorted(scan.features))
+
+
+@pytest.mark.parametrize("uri_arg", ["uri=1", "uri='yes'", "uri=flag"])
+def test_blocker3_truthy_or_dynamic_uri_flag_is_not_treated_as_a_plain_path(env, uri_arg):
+    """With the cwd as a write root, the plain-path reading puts ``file:/...`` under the cwd; SQLite opens ``/...``."""
+    code = (f"import json\nimport sqlite3\nflag = json.loads('1')\nc = sqlite3.connect('file:@H@/.hermes/state.db', {uri_arg})\n"
+            "c.execute('CREATE TABLE t(x)')")
+    scan = _scan_with_roots(env, code, [env.work])
+    assert scan.tier != "safe", (scan.reasons, sorted(scan.features))
+
+
+def test_blocker3_file_uri_with_an_unknown_uri_flag_is_review_even_for_reads(env):
+    scan = env.scan("import json\nimport sqlite3\nflag = json.loads('1')\nsqlite3.connect('file:@H@/a.db', uri=flag).execute('select 1')")
+    assert scan.tier == "review"
+
+
+def test_blocker3_positional_uri_flag_is_honoured(env):
+    code = ("import sqlite3\nc = sqlite3.connect('file:@S@/%2E%2E/x.db', 5.0, 0, 'DEFERRED', True, None, 128, True)\n"
+            "c.execute('CREATE TABLE t(x)')")
+    assert env.scan(code).tier == "review"
+    # Same program with the cwd as a root and a plain absolute target: still decoded, still outside.
+    assert _scan_with_roots(env, code.replace("@S@/%2E%2E/x.db", "@H@/%2E%2E/x.db"), [env.work]).tier == "review"
+
+
+@pytest.mark.parametrize("call", [
+    "Path('@S@/a').copy('@H@/.bashrc')", "Path('@S@/a').copy(target='@H@/.bashrc')", "Path('@S@/a').copy_into('@H@')",
+    "Path('@S@/a').move('@H@/.bashrc')", "Path('@S@/a').move_into('@H@')", "Path('@H@/a').move('@S@/b')",
+    "Path('@S@/a').copy(**{})",
+])
+def test_blocker4_path_copy_and_move_are_path_operations(env, call):
+    scan = env.scan(f"from pathlib import Path\n{call}")
+    assert scan.tier != "safe", (scan.reasons, sorted(scan.features))
+
+
+def test_blocker4_path_copy_to_hermes_config_is_high(env):
+    scan = env.scan("from pathlib import Path\nPath('@S@/a').copy('~/.hermes/config.yaml')")
+    assert scan.tier == "high", (scan.reasons, sorted(scan.features))
+
+
+def test_blocker4_aliasing_copy_or_replace_escapes_the_vetting(env):
+    assert env.scan("from pathlib import Path\nf = Path('@S@/a').copy\nf('@H@/.bashrc')").tier != "safe"
+    assert env.scan("from pathlib import Path\nf = Path('@S@/a').replace\nf('@H@/.bashrc')").tier != "safe"
+
+
+def test_blocker5_a_method_defined_on_some_class_does_not_whitelist_that_name_on_other_receivers(env):
+    code = (
+        "import sqlite3\n"
+        "class Mine:\n    def backup(self, target):\n        return target\n"
+        "mem = sqlite3.connect(':memory:')\n"
+        "mem.backup(sqlite3.connect('@H@/.hermes/state.db'))\n"
+    )
+    scan = env.scan(code)
+    assert scan.tier == "review" and "call:method:backup" in scan.features, (scan.reasons, sorted(scan.features))
+
+
+def test_blocker5_unknown_receiver_calling_a_locally_defined_method_name_is_review(env):
+    scan = env.scan("class A:\n    def run(self):\n        return 1\ndef make():\n    return input()\nmake().run()")
+    assert scan.tier == "review"
+
+
+def test_blocker5_a_local_class_does_not_whitelist_its_method_for_another_classs_instance(env):
+    scan = env.scan("class A:\n    def f(self):\n        return 1\nclass B:\n    pass\nB().f()")
+    assert scan.tier == "review"
+
+
+@pytest.mark.parametrize("name", [".git/hooks/pre-commit", ".git/config", "sub/.git", ".git"])
+def test_blocker7_git_metadata_inside_a_write_root_is_not_a_root_write(env, name):
+    scan = env.scan(f"from pathlib import Path\nPath('@S@/{name}').write_text('x')")
+    assert scan.tier == "review" and "write:outside" in scan.features, (scan.reasons, sorted(scan.features))
+
+
+def test_blocker7_git_dir_in_a_worktree_root_is_excluded_via_open_sqlite_and_delete(env):
+    (env.work / ".git").write_text("gitdir: /elsewhere\n")
+    roots = [env.work]
+    assert _scan_with_roots(env, "open('@W@/.git', 'w').write('x')", roots).tier != "safe"
+    assert _scan_with_roots(env, "open('@W@/.GIT/hooks/post-checkout', 'w').write('x')", roots).tier != "safe"
+    assert _scan_with_roots(
+        env, "import sqlite3\nsqlite3.connect('@W@/.git/x.db').execute('CREATE TABLE t(x)')", roots).tier != "safe"
+    assert _scan_with_roots(env, "from pathlib import Path\nPath('@W@/.git/index').unlink()", roots).tier == "high"
+    # ...while an ordinary file in the same root is still a root write.
+    assert _scan_with_roots(env, "open('@W@/ok.txt', 'w').write('x')", roots).tier == "safe"
+
+
+def test_blocker7_git_dir_reached_through_a_symlink_inside_the_root_is_excluded(env):
+    (env.work / ".git").mkdir()
+    os.symlink(env.work / ".git", env.work / "innocent")
+    assert _scan_with_roots(env, "open('@W@/innocent/config', 'w').write('x')", [env.work]).tier != "safe"
+
+
+# --- should-fix: credential globs, key shape --------------------------------------------------------------------
+
+@pytest.mark.parametrize("path", [
+    "@H@/.config/gh/hosts.yml", "@H@/.kube/config", "@H@/.docker/config.json", "@H@/.gnupg/private-keys-v1.d/a.key",
+    "~/.config/gh/hosts.yml",
+])
+def test_more_credential_paths_are_high(env, path):
+    assert env.scan(f"print(open({path!r}).read())").tier == "high"
+
+
+@pytest.mark.parametrize("path", [
+    "@H@/.bashrc", "@H@/.zshrc", "@H@/.config/app/settings.toml", "@H@/.local/share/x", "~/.bashrc",
+])
+def test_reading_dotfiles_directly_under_home_is_review(env, path):
+    scan = env.scan(f"print(open({path!r}).read())")
+    assert scan.tier == "review", (scan.reasons, sorted(scan.features))
+
+
+def test_reading_under_hermes_home_and_plain_home_files_stays_safe(env):
+    assert env.scan("print(open('@H@/.hermes/skills/x/SKILL.md').read())").tier == "safe"
+    assert env.scan("print(open('@H@/notes/.hidden').read())").tier == "safe"
+
+
+def test_capability_key_over_512_chars_is_rounded_to_an_opaque_digest(env):
+    features = frozenset(f"call:mod{i}.function_with_a_long_name_{i}" for i in range(40))
+    key = capability_key(CodeScan("review", features, ()), "execute_code")
+    assert len(key) <= 512 and key.startswith("execute_code:cap:opaque:")
+    assert key != capability_key(CodeScan("review", features | {"call:other"}, ()), "execute_code")
+    assert key == capability_key(CodeScan("review", features, ()), "execute_code")
+
+
+def test_capability_key_just_under_the_limit_is_kept_verbatim(env):
+    key = capability_key(CodeScan("review", frozenset({"call:os.kill"}), ()), "execute_code")
+    assert "opaque:" not in key and "call:os.kill" in key
+
+
+@pytest.mark.parametrize("code", [
+    "open('@H@/notes.txt', 'w').write('x')",                                     # write:outside
+    "def r(p):\n    return open(p).read()\nr('a')",                               # read:dynamic
+    "import subprocess\nsubprocess.run(input())",                                 # proc:direct, command not constant
+    "import subprocess\nsubprocess.run(['ls', input()])",                         # proc:direct, argv not constant
+])
+def test_coarse_capability_keys_are_not_persistable(env, code):
+    scan = env.scan(code)
+    assert scan.tier == "review" and not capability_persistable(scan), (scan.reasons, sorted(scan.features))
+
+
+@pytest.mark.parametrize("code", [
+    "import subprocess\nsubprocess.run(['ls', '-la'])",
+    "import os\nprint(os.listdir('.'))",
+    "from hermes_tools import web_search\nweb_search('x')",
+    "open('@S@/a', 'w').write('x')",
+])
+def test_fine_grained_keys_stay_persistable(env, code):
+    assert capability_persistable(env.scan(code))

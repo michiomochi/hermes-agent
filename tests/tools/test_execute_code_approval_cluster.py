@@ -622,14 +622,22 @@ def test_prescreen_shadow_changes_nothing(prescreen, monkeypatch, caplog):
     """Shadow logs the tier but the decision path is byte-for-byte the old one: the guardian is asked (even for a
     SAFE program), with the old call shape, and the old blanket key is what the person's answer is stored under."""
     prescreen.mode("shadow")
-    calls = _guardian(monkeypatch, "escalate")
+    calls = []
+
+    # The stub has the pre-pre-screen signature on purpose: shadow must not pass ``static_summary`` / ``allowed_roots``
+    # at all (a stub with defaults for them would hide a regression that sends ``static_summary=None``).
+    def old_shape(command, description, *, code=None):
+        calls.append({"code": code})
+        return "escalate"
+
+    monkeypatch.setattr(approval_smart, "_smart_approve", old_shape)
     _register_resolver(prescreen.session, "session")
 
     with caplog.at_level("INFO", logger="tools.approval"):
         result = A.check_execute_code_guard(SAFE_PROGRAM, "local")
 
     assert result["approved"] is True and result.get("user_approved") is True
-    assert calls == [{"code": SAFE_PROGRAM, "static_summary": None, "allowed_roots": None}]
+    assert calls == [{"code": SAFE_PROGRAM}]
     assert A.is_approved(prescreen.session, "execute_code") is True      # legacy blanket key, as before
     assert any("code_prescreen tier=safe mode=shadow" in r.getMessage() for r in caplog.records)
 
@@ -803,3 +811,125 @@ def test_prescreen_linked_git_worktree_of_cwd_is_a_write_root(prescreen, monkeyp
     primary = tmp_path / "primary"
     (primary / ".git").mkdir(parents=True)
     assert str(primary.resolve()) not in A._code_write_roots(str(primary))
+
+
+# --- review round 2 ---------------------------------------------------------------------------------------------
+
+@pytest.fixture
+def child_cwd(prescreen, monkeypatch, tmp_path):
+    """A linked git worktree as TERMINAL_CWD (so the cwd is a write root) plus a separate $HOME; the session cwd
+    record starts empty and is driven by ``child_cwd.cd``."""
+    from tools import code_execution_tool, terminal_tool
+
+    home, wt = tmp_path / "home", tmp_path / "wt"
+    home.mkdir()
+    wt.mkdir()
+    (wt / ".git").write_text("gitdir: /elsewhere\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("TERMINAL_CWD", str(wt))
+    monkeypatch.setattr(code_execution_tool, "_get_execution_mode", lambda: "project")
+    recorded = {}
+    monkeypatch.setattr(terminal_tool, "get_session_cwd", lambda key: recorded.get(key))
+
+    class Ctl:
+        pass
+
+    Ctl.home, Ctl.wt = home, wt
+    Ctl.cd = staticmethod(lambda task, path: recorded.__setitem__(task, str(path)))
+    return Ctl
+
+
+def test_blocker6_scan_cwd_follows_the_sessions_recorded_cd_like_the_child(child_cwd):
+    import os
+    assert os.path.realpath(A._code_scan_cwd("t1")) == os.path.realpath(child_cwd.wt)
+    child_cwd.cd("t1", child_cwd.home)              # `cd ~` in the session's terminal
+    assert os.path.realpath(A._code_scan_cwd("t1")) == os.path.realpath(child_cwd.home)
+    assert os.path.realpath(A._code_scan_cwd("other-task")) == os.path.realpath(child_cwd.wt)
+
+
+def test_blocker6_relative_write_after_cd_home_is_not_safe(child_cwd):
+    program = "open('.bashrc', 'a').write('x')"
+    scan, _ = A._code_prescreen(program, "t1")
+    assert scan.tier == "safe"                      # the worktree is the cwd: a root write
+    child_cwd.cd("t1", child_cwd.home)
+    scan, _ = A._code_prescreen(program, "t1")
+    assert scan.tier != "safe" and "write:outside" in scan.features
+
+
+def test_blocker6_strict_mode_scans_in_the_staging_dir_not_the_session_cwd(child_cwd, monkeypatch):
+    import os
+    import tempfile
+    from tools import code_execution_tool
+    monkeypatch.setattr(code_execution_tool, "_get_execution_mode", lambda: "strict")
+    child_cwd.cd("t1", child_cwd.home)
+    assert os.path.realpath(A._code_scan_cwd("t1")) == os.path.realpath(tempfile.gettempdir())
+
+
+def test_blocker6_guard_hands_the_task_id_to_the_scan(prescreen, monkeypatch):
+    _guardian(monkeypatch, "approve")
+    seen = []
+    real = A._code_prescreen
+    monkeypatch.setattr(A, "_code_prescreen", lambda code, task_id="": (seen.append(task_id), real(code, task_id))[1])
+    assert A.check_execute_code_guard(SAFE_PROGRAM, "local", task_id="t1")["approved"] is True
+    assert seen == ["t1"]
+
+
+def test_blocker6_execute_code_passes_its_task_id_to_the_guard(monkeypatch):
+    from tools.code_execution_tool import execute_code
+    seen = {}
+
+    def guard(code, env_type, has_host_access=False, task_id=""):
+        seen["task_id"] = task_id
+        return {"approved": False, "message": "stop"}
+
+    monkeypatch.setattr("tools.approval.check_execute_code_guard", guard)
+    execute_code(code="print(1)", task_id="abc-123")
+    assert seen == {"task_id": "abc-123"}
+
+
+@pytest.mark.parametrize("answer", ["session", "always"])
+def test_coarse_capability_cannot_be_granted_for_session_or_always(prescreen, monkeypatch, tmp_path, answer):
+    program = f"open({str(tmp_path / 'elsewhere.txt')!r}, 'w').write('x')"        # write:outside, REVIEW
+    calls = _guardian(monkeypatch, "escalate")
+    shown = _register_capturing_resolver(prescreen.session, answer)
+
+    result = A.check_execute_code_guard(program, "local")
+
+    assert result["approved"] is True and result.get("user_approved") is True
+    assert calls[0]["static_summary"]["tier"] == "review"
+    data = shown["approval_data"]
+    assert data["allow_session"] is False and data["allow_permanent"] is False and data["persist_allowed"] is False
+    key = _cap_key(program, prescreen, monkeypatch)
+    assert not A.is_approved(prescreen.session, key) and not A.is_approved(prescreen.session, "execute_code")
+    # ...so the very same program is asked about again.
+    calls.clear()
+    shown = _register_capturing_resolver(prescreen.session, "once")
+    assert A.check_execute_code_guard(program, "local").get("user_approved") is True and len(calls) == 1
+
+
+def test_coarse_capability_ignores_a_blanket_grant_made_earlier(prescreen, monkeypatch, tmp_path):
+    program = f"open({str(tmp_path / 'elsewhere.txt')!r}, 'w').write('x')"
+    A._persist_choice(prescreen.session, "session", ["execute_code"])
+    assert A.is_approved(prescreen.session, "execute_code")
+    calls = _guardian(monkeypatch, "escalate")
+    _register_resolver(prescreen.session, "once")
+    assert A.check_execute_code_guard(program, "local").get("user_approved") is True
+    assert len(calls) == 1
+
+
+def test_coarse_capability_lets_a_guardian_approve_end_the_gate(prescreen, monkeypatch, tmp_path):
+    """Unlike HIGH, a coarse REVIEW program is still the guardian's call; only the grant scope is narrowed."""
+    program = f"open({str(tmp_path / 'elsewhere.txt')!r}, 'w').write('x')"
+    _guardian(monkeypatch, "approve")
+    result = A.check_execute_code_guard(program, "local")
+    assert result["approved"] is True and result.get("smart_approved") is True
+    assert not A.is_approved(prescreen.session, _cap_key(program, prescreen, monkeypatch))
+
+
+def test_fine_grained_capability_can_still_be_granted_for_the_session(prescreen, monkeypatch):
+    calls = _guardian(monkeypatch, "escalate")
+    shown = _register_capturing_resolver(prescreen.session, "session")
+    assert A.check_execute_code_guard(REVIEW_PROGRAM, "local").get("user_approved") is True
+    assert shown["approval_data"]["allow_session"] is True
+    assert A.check_execute_code_guard(SAME_CAPABILITY, "local").get("approved") is True
+    assert len(calls) == 1

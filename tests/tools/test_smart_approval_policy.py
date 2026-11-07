@@ -182,7 +182,7 @@ class TestCodeReviewerPrompt(unittest.TestCase):
     @patch("agent.auxiliary_client.call_llm")
     def test_user_message_carries_summary_then_fenced_code(self, mock_call_llm, mock_cfg):
         _, _, user = self._run(mock_call_llm, mock_cfg, code="x = 1  # note\n")
-        assert user.startswith("Hermes static analysis (computed by Hermes from the code, not written by the agent):")
+        assert user.startswith("Hermes static analysis (computed from the code; identifiers below come from the program):")
         assert '"tier":"review"' in user and '"features":["net:none","proc:gated"]' in user
         assert user.index("static analysis") < user.index("<code>") < user.index("x = 1") < user.index("</code>")
         assert "# note" not in user          # Python comments are stripped with tokenize

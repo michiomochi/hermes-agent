@@ -349,7 +349,7 @@ def _smart_approve(command: str, description: str, *, code: str | None = None,
             )
         if code is not None and static_summary is not None:
             user_prompt = (
-                "Hermes static analysis (computed by Hermes from the code, not written by the agent):\n"
+                "Hermes static analysis (computed from the code; identifiers below come from the program):\n"
                 f"{_static_summary_json(static_summary)}\n\n"
                 f"<code>\n{_fence_escape(_strip_python_comments(code))}\n</code>\n\n"
                 "Answer on the FIRST line with exactly one word: APPROVE, DENY, or ESCALATE."

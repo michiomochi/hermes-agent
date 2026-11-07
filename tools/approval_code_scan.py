@@ -34,6 +34,7 @@ import re
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Literal, Sequence
+from urllib.parse import parse_qsl, unquote
 
 logger = logging.getLogger("tools.approval")
 
@@ -67,6 +68,7 @@ _AXES: dict[str, tuple[str, ...]] = {
     "env": ("none", "key", "dump"),
 }
 _ALWAYS_IN_SIGNATURE = ("net", "write", "proc")
+_MAX_KEY_SIGNATURE = 512
 
 
 def capability_key(scan: CodeScan, namespace: str) -> str:
@@ -83,7 +85,31 @@ def capability_key(scan: CodeScan, namespace: str) -> str:
     for axis in _ALWAYS_IN_SIGNATURE:
         best.setdefault(axis, 0)
     parts = {f"{axis}:{_AXES[axis][idx]}" for axis, idx in best.items() if idx or axis in _ALWAYS_IN_SIGNATURE}
-    return f"{namespace}:cap:" + "|".join(sorted(parts | loose))
+    signature = "|".join(sorted(parts | loose))
+    if len(signature) > _MAX_KEY_SIGNATURE:
+        # A program that names hundreds of distinct things must not store a huge key in the config.
+        signature = "opaque:" + hashlib.sha256(signature.encode("utf-8", "surrogatepass")).hexdigest()
+    return f"{namespace}:cap:{signature}"
+
+
+def capability_persistable(scan: CodeScan) -> bool:
+    """False when the capability key is too coarse for a session/always grant to be safe.
+
+    ``write:outside`` (and the dynamic/symlink writes above it), ``read:dynamic`` and ``proc:direct`` with a command
+    that is not a constant each cover an unbounded set of targets under ONE key, so a single approval would pass all
+    of them. Those are decided per run; every other key is as fine-grained as it ever was.
+    """
+    best: dict[str, int] = {}
+    for feature in scan.features:
+        axis, _, value = feature.partition(":")
+        order = _AXES.get(axis)
+        if order is not None and value in order:
+            best[axis] = max(best.get(axis, 0), order.index(value))
+    if best.get("write", 0) >= _AXES["write"].index("outside"):
+        return False
+    if best.get("read", 0) >= _AXES["read"].index("dynamic"):
+        return False
+    return "proc:nonconst" not in scan.features
 
 
 def scan_summary(scan: CodeScan) -> dict:
@@ -213,6 +239,11 @@ _PATH_READ = frozenset({"read_text", "read_bytes"})
 _PATH_WRITE = frozenset({"write_text", "write_bytes", "mkdir", "touch", "chmod"})
 _PATH_DELETE = frozenset({"unlink", "rmdir"})
 _PATH_MOVE = frozenset({"rename", "replace"})
+# Python 3.14 ``Path.copy`` / ``copy_into`` / ``move`` / ``move_into``.
+_PATH_TRANSFER = frozenset({"copy", "copy_into", "move", "move_into"})
+# Names that are in ``_SAFE_METHODS`` (str/list/dict/datetime methods) but are also path operations: using them as a
+# value (``f = p.copy``) would hide the call from the path vetting.
+_ALIAS_UNSAFE = frozenset({"copy", "replace"})
 _PATH_LINK = frozenset({"symlink_to", "hardlink_to", "link_to"})
 _SQL_METHODS = frozenset({"execute", "executemany", "executescript"})
 # Effectful names must appear directly as the callee, where they are vetted; aliasing or passing them on
@@ -254,6 +285,7 @@ _CRED_GLOBS = (
     "**/.env*", "**/auth.json", "**/.ssh/**", "/proc/*/environ", "**/*credentials*", "**/*token*", "**/.netrc",
     "**/.aws/**", "**/.git-credentials", "**/id_rsa*", "**/id_ed25519*", "**/.npmrc", "**/.pypirc",
     "/etc/shadow*", "/etc/sudoers*",
+    "**/.config/gh/**", "**/.kube/config", "**/.docker/config.json", "**/.gnupg/**",
 )
 # Hermes's own config and source: a script must never rewrite these on its own.
 _SELF_MODIFY_GLOBS = (
@@ -297,18 +329,32 @@ _SQL_WRITE_WORDS = re.compile(
     r"|replace\s+into)\b",
     re.IGNORECASE,
 )
-_SQL_SAFE_PRAGMA = re.compile(
-    r"^pragma\s+(\w+\s*(\([^=;]*\))?|(table_info|table_xinfo|index_list|index_info|foreign_key_list)\s*\([^=;]*\))"
-    r"\s*;?\s*$",
-    re.IGNORECASE | re.DOTALL,
+_SQL_PRAGMA = re.compile(r"^pragma\s+(?P<name>[a-z_]+)\s*(?:\((?P<arg>[^=;()]*)\))?\s*;?\s*$", re.IGNORECASE)
+# ``PRAGMA name(value)`` WRITES (``schema_version(1)``, ``journal_mode(OFF)`` ...), so only pragmas that merely look
+# something up may take an argument ...
+_PRAGMA_READ_WITH_ARG = frozenset(
+    "table_info table_xinfo table_list index_list index_info index_xinfo foreign_key_list foreign_key_check "
+    "integrity_check quick_check".split()
+)
+# ... and without one only pragmas that report a setting; ``wal_checkpoint``, ``optimize``, ``incremental_vacuum``
+# and ``shrink_memory`` do work on the database even when bare.
+_PRAGMA_READ_BARE = _PRAGMA_READ_WITH_ARG | frozenset(
+    "user_version schema_version application_id journal_mode page_count page_size freelist_count encoding "
+    "foreign_keys busy_timeout database_list collation_list compile_options function_list module_list pragma_list "
+    "data_version max_page_count locking_mode synchronous temp_store cache_size auto_vacuum secure_delete "
+    "wal_autocheckpoint mmap_size query_only recursive_triggers read_uncommitted".split()
 )
 
 
 def _sql_is_read(sql: str) -> bool:
-    """True only for one read-only statement: SELECT / WITH / EXPLAIN without write keywords, or a bare PRAGMA."""
+    """True only for one read-only statement: SELECT / WITH / EXPLAIN without write keywords, or a read-only PRAGMA."""
     text = sql.strip()
-    if _SQL_SAFE_PRAGMA.match(text):
-        return not re.search(r"=", text)
+    if re.match(r"(?i)^pragma\b", text):
+        match = _SQL_PRAGMA.match(text)
+        if match is None:
+            return False
+        name = match.group("name").lower()
+        return name in (_PRAGMA_READ_WITH_ARG if match.group("arg") is not None else _PRAGMA_READ_BARE)
     if not re.match(r"(?is)^(select|with|explain)\b", text):
         return False
     body = _SQL_STR.sub("''", text).rstrip(";").strip()
@@ -343,12 +389,17 @@ class _Scanner(ast.NodeVisitor):
             os.path.join(hermes, "config.yaml"), os.path.join(hermes, "hermes-agent", "**"),
         )
         self.home = home
+        # Reading these dot-directories under $HOME is routine for Hermes itself; any other dot entry is REVIEW.
+        self.dot_exempt = [os.path.realpath(os.path.join(home, ".hermes")), os.path.realpath(hermes)]
         self.features: set[str] = set()
         self.review: list[str] = []
         self.high: list[str] = []
         self.imports: dict[str, str] = {}
         self.module_aliases: set[str] = set()
-        self.local_methods: set[str] = set()  # methods the program itself defines (their bodies are scanned too)
+        # Methods the program itself defines, per class (their bodies are scanned too). A call is only trusted when the
+        # receiver is provably an instance of such a class, never merely because some class has a method of that name.
+        self.class_methods: dict[str, set[str]] = {}
+        self.class_bases: dict[str, list[str]] = {}
         self.ambiguous: set[str] = set()
         self.bindings: dict[str, list[str]] = {}
         self.const_values: dict[str, ast.AST] = {}
@@ -387,8 +438,9 @@ class _Scanner(ast.NodeVisitor):
         for node in ast.walk(self.tree):
             if isinstance(node, ast.FunctionDef):
                 bind(node.name, "def")
-                if isinstance(getattr(node, _PARENT, None), ast.ClassDef) and node.name not in _EFFECT_ATTRS:
-                    self.local_methods.add(node.name)
+                owner = getattr(node, _PARENT, None)
+                if isinstance(owner, ast.ClassDef) and node.name not in _EFFECT_ATTRS:
+                    self.class_methods.setdefault(owner.name, set()).add(node.name)
                 for a in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs):
                     bind(a.arg, "other")
                 for a in (node.args.vararg, node.args.kwarg):
@@ -396,6 +448,8 @@ class _Scanner(ast.NodeVisitor):
                         bind(a.arg, "other")
             elif isinstance(node, ast.ClassDef):
                 bind(node.name, "class")
+                self.class_methods.setdefault(node.name, set())
+                self.class_bases[node.name] = [b.id for b in node.bases if isinstance(b, ast.Name)]
             elif isinstance(node, ast.Lambda):
                 for a in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs):
                     bind(a.arg, "other")
@@ -583,8 +637,37 @@ class _Scanner(ast.NodeVisitor):
         return self._abs(value)
 
     # -- file operations ---------------------------------------------------------------------------------------
-    def _in_roots(self, real: str) -> bool:
+    def _under_roots(self, real: str) -> bool:
         return any(real == r or real.startswith(r + os.sep) for r in self.roots)
+
+    @staticmethod
+    def _has_git_component(path: str) -> bool:
+        return any(part.lower() == ".git" for part in path.split(os.sep))
+
+    def _in_roots(self, real: str) -> bool:
+        """Inside a write root, but never in ``.git``: the next ``git status`` would run what a script put there
+        (hooks, ``core.fsmonitor``, ``core.sshCommand`` ...), so ``.git`` is not part of any root."""
+        for root in self.roots:
+            if real == root or real.startswith(root + os.sep):
+                if not self._has_git_component(real[len(root):]):
+                    return True
+        return False
+
+    def _root_write_ok(self, path: str) -> bool:
+        """``path`` (as written) and where it really lands are both inside a root and neither is in ``.git``."""
+        return self._in_roots(os.path.realpath(path)) and not self._has_git_component(path)
+
+    def _home_dot_entry(self, path: str) -> bool:
+        """A dotfile / dot-directory directly under $HOME (``~/.bashrc``, ``~/.config/x``) that is neither Hermes's own
+        nor inside a write root."""
+        for home in {self.home, os.path.realpath(self.home)}:
+            if path.startswith(home + os.sep):
+                first = path[len(home) + 1:].split(os.sep, 1)[0]
+                if first.startswith(".") and first not in (".", ".."):
+                    if any(path == e or path.startswith(e + os.sep) for e in self.dot_exempt):
+                        return False
+                    return not self._under_roots(os.path.realpath(path))
+        return False
 
     def _file_op(self, node, path: str | None, kind: str, what: str) -> None:
         """``kind`` is read | write | delete; ``path`` an absolute, normalised path or None (not foldable)."""
@@ -608,13 +691,16 @@ class _Scanner(ast.NodeVisitor):
         if kind == "read":
             if any(_is_cred_path(p) for p in candidates):
                 self.hi(node, "read:cred", f"{what}: reads a credential-like path")
+            elif any(self._home_dot_entry(p) for p in candidates):
+                self.features.add("read:fs")
+                self.rev(node, "read:homedot", f"{what}: reads a dotfile or dot-directory under $HOME")
             else:
                 self.features.add("read:fs")
             return
         if any(_fnmatch_any(p, self.self_modify_globs) for p in candidates):
             self.hi(node, f"{kind}:outside", f"{what}: modifies Hermes's own config or source")
             return
-        in_roots = self._in_roots(real)
+        in_roots = self._in_roots(real) and not self._has_git_component(path)
         if kind == "delete":
             if in_roots:
                 self.features.add("del:roots")
@@ -738,7 +824,8 @@ class _Scanner(ast.NodeVisitor):
             if isinstance(root, ast.Name) and root.id in self.imports:
                 self.rev(node, "patch:module", "assignment to an attribute of an imported object")
         is_callee = isinstance(parent, ast.Call) and parent.func is node
-        if attr in _EFFECT_ATTRS and not is_callee and attr not in _SAFE_METHODS:
+        if (attr in _EFFECT_ATTRS or attr in _PATH_TRANSFER) and not is_callee \
+                and (attr not in _SAFE_METHODS or attr in _ALIAS_UNSAFE):
             self.rev(node, f"alias:{attr}", f"{attr} used as a value")
         origin = self.origin(node)
         if origin:
@@ -844,18 +931,77 @@ class _Scanner(ast.NodeVisitor):
             self._call_origin(node, origin)
             return
         method = func.attr
+        receiver = self.fold(func.value)
+        is_path = isinstance(receiver, PurePosixPath)
         if method in _PATH_READ | _PATH_WRITE | _PATH_DELETE | _PATH_LINK or method == "open":
             self._path_method(node, func, method)
         elif method in _PATH_MOVE:
-            if len(node.args) == 1 and not node.keywords:
+            if self._is_path_move(node, method, receiver):
                 self._path_method(node, func, method)
             # str.replace(old, new) / datetime.replace(**kw) fall through as ordinary methods
+        elif method in _PATH_TRANSFER and (is_path or (method == "copy" and (node.args or node.keywords))):
+            if is_path:
+                self._path_method(node, func, method)
+            else:  # list.copy() / dict.copy() take no argument; with one this is Path.copy on a receiver we cannot see
+                self.rev(node, "write:dynamic", f".{method}() with arguments on a receiver that is not a known Path")
         elif method in _SQL_METHODS:
             self._sql_call(node, method)
-        elif method in _SAFE_METHODS or method in self.local_methods:
+        elif method in _SAFE_METHODS or self._is_local_method_call(func):
             return
         else:
             self.rev(node, f"call:method:{method}", f"unrecognised method call .{method}()")
+
+    @staticmethod
+    def _is_path_move(node: ast.Call, method: str, receiver) -> bool:
+        """``Path.rename(target)`` / ``Path.replace(target)`` versus ``str.replace(old, new)`` /
+        ``datetime.replace(hour=0)``. Anything that can be the path operation is treated as one, keyword form included."""
+        if isinstance(receiver, PurePosixPath) or method == "rename":
+            return True
+        if isinstance(receiver, str):
+            return False
+        names = {kw.arg for kw in node.keywords}
+        if None in names or "target" in names:
+            return True
+        return len(node.args) == 1 and not names
+
+    def _class_has_method(self, cls: str, method: str, _seen: frozenset = frozenset()) -> bool:
+        if cls in _seen or self.bindings.get(cls) != ["class"]:
+            return False
+        if method in self.class_methods.get(cls, ()):
+            return True
+        return any(self._class_has_method(b, method, _seen | {cls}) for b in self.class_bases.get(cls, ()))
+
+    def _instance_class(self, node) -> str | None:
+        """Name of the program's own class when ``node`` is ``Cls(...)`` or a top-level ``x = Cls(...)`` variable."""
+        if isinstance(node, ast.Name) and self.bindings.get(node.id) == ["assign-top"]:
+            node = self.const_values.get(node.id)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and self.bindings.get(node.func.id) == ["class"]:
+            return node.func.id
+        return None
+
+    def _is_local_method_call(self, func: ast.Attribute) -> bool:
+        """``self.m()`` inside a method, or ``m()`` on a provable instance of a class the program defines itself and
+        which defines ``m`` (its body is scanned like any other). A bare method NAME proves nothing about the receiver:
+        ``mem.backup(...)`` is sqlite's even when some class of the program also defines ``backup``."""
+        method, receiver = func.attr, func.value
+        cls = self._instance_class(receiver)
+        if cls is not None:
+            return self._class_has_method(cls, method)
+        if isinstance(receiver, ast.Name):
+            fn = getattr(func, _PARENT, None)
+            while fn is not None and not isinstance(fn, (ast.FunctionDef, ast.Lambda, ast.Module)):
+                fn = getattr(fn, _PARENT, None)
+            if not isinstance(fn, ast.FunctionDef) or not fn.args.args or fn.args.args[0].arg != receiver.id:
+                return False
+            owner = getattr(fn, _PARENT, None)
+            if not isinstance(owner, ast.ClassDef):
+                return False
+            rebound = any(
+                isinstance(n, ast.Name) and n.id == receiver.id and isinstance(n.ctx, (ast.Store, ast.Del))
+                for n in ast.walk(fn)
+            )
+            return not rebound and self._class_has_method(owner.name, method)
+        return False
 
     def _call_origin(self, node: ast.Call, origin: str) -> None:
         parts = origin.split(".")
@@ -921,9 +1067,20 @@ class _Scanner(ast.NodeVisitor):
             self._file_op(node, receiver, "read", what)
         elif method in _PATH_DELETE:
             self._file_op(node, receiver, "delete", what)
-        elif method in _PATH_MOVE:
-            self._file_op(node, receiver, "delete", what)  # the source disappears
-            self._file_op(node, self.fold_path(node.args[0]), "write", what)
+        elif method in _PATH_MOVE or method in _PATH_TRANSFER:
+            moves = method in _PATH_MOVE or method.startswith("move")
+            if moves:
+                self._file_op(node, receiver, "delete", what)  # the source disappears
+            else:
+                self._file_op(node, receiver, "read", what)
+            dest_node = None
+            if kwargs is not None:  # ``**kwargs`` hides the destination: not foldable -> write:dynamic
+                dest_node = node.args[0] if node.args else (kwargs.get("target") or kwargs.get("target_dir"))
+            dest = self.fold_path(dest_node) if dest_node is not None else None
+            if dest is not None and method.endswith("_into") and receiver is not None \
+                    and getattr(dest, "alt", None) is None:
+                dest = os.path.join(dest, os.path.basename(str(receiver)))  # lands as <dir>/<name>, name may be .git
+            self._file_op(node, dest, "write", what)
         else:
             self._file_op(node, receiver, "write", what)
 
@@ -948,11 +1105,16 @@ class _Scanner(ast.NodeVisitor):
         if kwargs is None:
             self.rev(node, "read:dynamic", "sqlite3.connect with **kwargs")
             return
-        target = node.args[0] if node.args else kwargs.get("database")
-        uri_node = kwargs.get("uri")
-        uri = isinstance(uri_node, ast.Constant) and uri_node.value is True
-        text = self.fold(target) if target is not None else None
         line = self._line(node)
+        if any(isinstance(a, ast.Starred) for a in node.args):
+            self.connects.append((None, False, False, line))
+            self.rev(node, "read:dynamic", "sqlite3.connect with *args")
+            return
+        target = node.args[0] if node.args else kwargs.get("database")
+        uri_node = node.args[7] if len(node.args) > 7 else kwargs.get("uri")   # connect(db, timeout, ..., uri)
+        # True / False when the flag is a constant (SQLite uses its truthiness); None when it is not.
+        uri: bool | None = False if uri_node is None else (bool(uri_node.value) if isinstance(uri_node, ast.Constant) else None)
+        text = self.fold(target) if target is not None else None
         if not isinstance(text, str):
             self.connects.append((None, False, False, line))
             self.rev(node, "read:dynamic", "sqlite3.connect: database path is not a constant")
@@ -962,12 +1124,32 @@ class _Scanner(ast.NodeVisitor):
             self.connects.append((None, False, True, line))
             return
         read_only = False
-        if uri and text.startswith("file:"):
-            body, _, query = text[5:].partition("?")
-            text = body
-            read_only = "mode=ro" in query
+        if text[:5].lower() == "file:" and uri is None:
+            # Whether this is a URI or a literal file name decides which file SQLite opens: do not guess.
+            self.connects.append((None, False, False, line))
+            self.rev(node, "read:dynamic", "sqlite3.connect: file: target with a uri flag that is not a constant")
+            return
+        if text[:5].lower() == "file:" and uri:
+            # SQLite percent-decodes the path ('%2E%2E' is '..') and takes mode= from the query string.
+            rest = text[5:].partition("#")[0]
+            body, _, query = rest.partition("?")
             if body.startswith("//"):
-                text = body[2:]
+                authority, slash, tail = body[2:].partition("/")
+                if authority not in ("", "localhost"):
+                    self.connects.append((None, False, False, line))
+                    self.rev(node, "read:dynamic", "sqlite3.connect: file: URI names a host")
+                    return
+                body = slash + tail
+            text = unquote(body)
+            if not text or "\x00" in text:
+                self.connects.append((None, False, False, line))
+                self.rev(node, "read:dynamic", "sqlite3.connect: file: URI path is empty or contains NUL")
+                return
+            modes = [v for k, v in parse_qsl(query, keep_blank_values=True) if k == "mode"]
+            if modes and modes[-1] == "memory":
+                self.connects.append((None, False, True, line))
+                return
+            read_only = bool(modes) and modes[-1] == "ro"
         path = self._abs(text)
         self.connects.append((path, read_only, False, line))
         self._file_op(node, path, "read", "sqlite3.connect")
@@ -1022,7 +1204,9 @@ class _Scanner(ast.NodeVisitor):
             self.features.add("proc:direct")
             self.rev(node, "proc:direct", f"direct process execution via {origin}")
             command = self._command_text(node)
-            if command is not None and self._dangerous_command(command):
+            if command is None:
+                self.features.add("proc:nonconst")  # the command is not a constant: one grant would cover any of them
+            elif self._dangerous_command(command):
                 self.hi(node, "proc:direct", f"{origin} runs a command flagged as dangerous")
         elif origin in _DELETE_ORIGINS or (isinstance(func, ast.Attribute) and func.attr == "rmtree"):
             target = self.fold_path(node.args[0]) if node.args else None
@@ -1054,7 +1238,7 @@ class _Scanner(ast.NodeVisitor):
         if self.db_write_lines:
             line = self.db_write_lines[0]
             ok = bool(self.connects) and all(
-                memory or (path is not None and self._in_roots(os.path.realpath(path)) and not read_only)
+                memory or (path is not None and self._root_write_ok(path) and not read_only)
                 for path, read_only, memory, _ in self.connects
             )
             if not ok:
